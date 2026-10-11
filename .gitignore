@@ -1,0 +1,11 @@
+# binaries
+/bin/
+*.exe
+
+# env / secrets
+.env
+*.pem
+
+# editor / OS
+.vscode/
+.DS_Store
