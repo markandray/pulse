@@ -1,5 +1,182 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Pulse</title>
+  <style>
+    body { margin: 0; font-family: sans-serif; }
+    #bar { padding: 8px; background: #eee; display: flex; gap: 8px; align-items: center; }
+    button.active { background: #333; color: #fff; }
+    canvas { display: block; background: #fff; }
+  </style>
+</head>
+<body>
+  <div id="bar">
+    Room: <b id="roomName"></b> | <span id="status">connecting...</span> |
+    <button data-tool="pen" class="active">Pen</button>
+    <button data-tool="rect">Rectangle</button>
+    <button data-tool="select">Select / Move</button>
+    <span>(select a shape, then press Delete)</span>
+  </div>
+  <canvas id="c"></canvas>
+
 <script>
-  const room = new URLSearchParams(location.search).get("room") || "abc";
-  const ws = new WebSocket(`ws://localhost:8080/ws?room=${room}`);
-  ws.onmessage = (e) => console.log("got:", e.data);
+const room = new URLSearchParams(location.search).get("room") || "abc";
+document.getElementById("roomName").textContent = room;
+
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+canvas.width = window.innerWidth;
+canvas.height = window.innerHeight - 40;
+ctx.lineWidth = 3;
+ctx.lineCap = "round";
+
+const myColor = `hsl(${Math.floor(Math.random() * 360)}, 70%, 45%)`;
+
+// ---------- client-side state ----------
+const segs = [];           // freehand segments
+const shapes = new Map();  // id -> shape
+let tool = "pen";
+let selected = null;       // id of selected shape
+let preview = null;        // rectangle being dragged out
+let drag = null;
+let last = null;
+
+// ---------- rendering ----------
+function render() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  for (const s of segs) {
+    ctx.strokeStyle = s.color;
+    ctx.beginPath();
+    ctx.moveTo(s.x0, s.y0);
+    ctx.lineTo(s.x1, s.y1);
+    ctx.stroke();
+  }
+
+  for (const sh of shapes.values()) {
+    ctx.globalAlpha = 0.25;
+    ctx.fillStyle = sh.color;
+    ctx.fillRect(sh.x, sh.y, sh.w, sh.h);
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = sh.color;
+    ctx.strokeRect(sh.x, sh.y, sh.w, sh.h);
+    if (sh.id === selected) {
+      ctx.setLineDash([5, 4]);
+      ctx.strokeStyle = "#000";
+      ctx.strokeRect(sh.x - 3, sh.y - 3, sh.w + 6, sh.h + 6);
+      ctx.setLineDash([]);
+    }
+  }
+
+  if (preview) {
+    ctx.setLineDash([5, 4]);
+    ctx.strokeStyle = myColor;
+    ctx.strokeRect(preview.x, preview.y, preview.w, preview.h);
+    ctx.setLineDash([]);
+  }
+}
+
+// ---------- ONE code path for local and remote events ----------
+function apply(msg) {
+  switch (msg.type) {
+    case "seg":
+      segs.push(msg);
+      break;
+    case "add":
+      shapes.set(msg.shape.id, msg.shape);
+      break;
+    case "move": {
+      const s = shapes.get(msg.id);
+      if (s) { s.x = msg.x; s.y = msg.y; }   // ignore moves of deleted shapes
+      break;
+    }
+    case "delete":
+      shapes.delete(msg.id);
+      if (selected === msg.id) selected = null;
+      break;
+  }
+  render();
+}
+
+// ---------- websocket ----------
+const ws = new WebSocket(`ws://localhost:8080/ws?room=${room}`);
+const status = document.getElementById("status");
+ws.onopen = () => status.textContent = "connected";
+ws.onclose = () => status.textContent = "disconnected";
+ws.onmessage = (e) => apply(JSON.parse(e.data));
+
+function emit(msg) {          // local action: apply now, then tell everyone else
+  apply(msg);
+  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+}
+
+// ---------- toolbar ----------
+document.querySelectorAll("#bar button").forEach((b) => {
+  b.onclick = () => {
+    tool = b.dataset.tool;
+    selected = null;
+    document.querySelectorAll("#bar button")
+      .forEach((x) => x.classList.toggle("active", x === b));
+    render();
+  };
+});
+
+// ---------- input ----------
+function hit(x, y) {
+  const list = [...shapes.values()].reverse();   // topmost first
+  return list.find((s) => x >= s.x && x <= s.x + s.w && y >= s.y && y <= s.y + s.h);
+}
+
+canvas.addEventListener("pointerdown", (e) => {
+  const x = e.offsetX, y = e.offsetY;
+  if (tool === "pen") {
+    drag = { kind: "pen" };
+    last = { x, y };
+  } else if (tool === "rect") {
+    drag = { kind: "rect", x0: x, y0: y };
+  } else if (tool === "select") {
+    const s = hit(x, y);
+    selected = s ? s.id : null;
+    if (s) drag = { kind: "move", id: s.id, dx: x - s.x, dy: y - s.y };
+    render();
+  }
+});
+
+canvas.addEventListener("pointermove", (e) => {
+  if (!drag) return;
+  const x = e.offsetX, y = e.offsetY;
+
+  if (drag.kind === "pen") {
+    emit({ type: "seg", color: myColor, x0: last.x, y0: last.y, x1: x, y1: y });
+    last = { x, y };
+  } else if (drag.kind === "rect") {
+    preview = {
+      x: Math.min(drag.x0, x), y: Math.min(drag.y0, y),
+      w: Math.abs(x - drag.x0), h: Math.abs(y - drag.y0),
+    };
+    render();
+  } else if (drag.kind === "move") {
+    emit({ type: "move", id: drag.id, x: x - drag.dx, y: y - drag.dy });
+  }
+});
+
+function endDrag() {
+  if (drag && drag.kind === "rect" && preview && preview.w > 5 && preview.h > 5) {
+    emit({ type: "add", shape: { id: crypto.randomUUID(), kind: "rect", color: myColor, ...preview } });
+  }
+  preview = null;
+  drag = null;
+  render();
+}
+canvas.addEventListener("pointerup", endDrag);
+canvas.addEventListener("pointerleave", endDrag);
+
+window.addEventListener("keydown", (e) => {
+  if ((e.key === "Delete" || e.key === "Backspace") && selected) {
+    emit({ type: "delete", id: selected });
+  }
+});
 </script>
+</body>
+</html>
