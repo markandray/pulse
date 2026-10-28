@@ -4,6 +4,7 @@ import (
     "log"
     "net/http"
 	"time"
+    "encoding/json"
 
     "github.com/gorilla/websocket"
 )
@@ -38,7 +39,28 @@ func (c *Client) readPump() {
         if err != nil {
             return
         }
-        c.hub.broadcast <- Message{Room: c.room, Data: data, From: c}
+        var ev Event
+        if err := json.Unmarshal(data, &ev); err != nil {
+            continue
+        }
+        msg := Message{Room: c.room, Data: data, From: c}
+        switch ev.Type {
+        case "add":
+            if ev.Shape == nil || ev.Shape.ID == "" {
+                continue
+            }
+            msg.Event = &ev
+        case "move", "delete":
+            if ev.ID == "" {
+                continue
+            }
+            msg.Event = &ev
+        case "seg":
+            // ephemeral: relayed as raw bytes
+        default:
+            continue
+        }
+        c.hub.broadcast <- msg
     }
 }
 

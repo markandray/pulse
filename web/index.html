@@ -37,6 +37,7 @@ const myColor = `hsl(${Math.floor(Math.random() * 360)}, 70%, 45%)`;
 const segs = [];           // freehand segments
 const shapes = new Map();  // id -> shape
 let tool = "pen";
+let lastSeq = 0;
 let selected = null;       // id of selected shape
 let preview = null;        // rectangle being dragged out
 let drag = null;
@@ -80,6 +81,12 @@ function render() {
 // ---------- ONE code path for local and remote events ----------
 function apply(msg) {
   switch (msg.type) {
+    case "snapshot":
+      shapes.clear();
+      for (const s of msg.shapes) shapes.set(s.id, s);
+      lastSeq = msg.seq;
+      selected = null;
+      break;
     case "seg":
       segs.push(msg);
       break;
@@ -106,8 +113,8 @@ ws.onopen = () => status.textContent = "connected";
 ws.onclose = () => status.textContent = "disconnected";
 ws.onmessage = (e) => apply(JSON.parse(e.data));
 
-function emit(msg) {          // local action: apply now, then tell everyone else
-  apply(msg);
+function emit(msg) {
+  if (msg.type === "seg") apply(msg);   // ephemeral: draw immediately
   if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
 }
 
