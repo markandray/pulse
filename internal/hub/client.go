@@ -1,10 +1,11 @@
 package hub
 
 import (
+    "context"
+    "encoding/json"
     "log"
     "net/http"
-	"time"
-    "encoding/json"
+    "time"
 
     "github.com/gorilla/websocket"
 )
@@ -17,10 +18,11 @@ const (
 )
 
 type Client struct {
-    hub  *Hub
-    conn *websocket.Conn
-    room string
-    send chan []byte
+    hub     *Hub
+    conn    *websocket.Conn
+    room    string
+    send    chan []byte
+    preload *Board
 }
 
 func (c *Client) readPump() {
@@ -89,6 +91,7 @@ func (c *Client) writePump() {
         }
     }
 }
+
 var upgrader = websocket.Upgrader{
     CheckOrigin: func(r *http.Request) bool { return true }, // dev only
 }
@@ -100,6 +103,19 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
         return
     }
 
+    var pre *Board
+    if h.store != nil {
+        ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+        b, err := h.store.Load(ctx, room)
+        cancel()
+        if err != nil {
+            log.Println("load:", err)
+            http.Error(w, "storage unavailable", http.StatusServiceUnavailable)
+            return
+        }
+        pre = b
+    }
+
     conn, err := upgrader.Upgrade(w, r, nil)
     if err != nil {
         log.Println("upgrade:", err)
@@ -107,10 +123,11 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
     }
 
     c := &Client{
-        hub:  h,
-        conn: conn,
-        room: room,
-        send: make(chan []byte, 64),
+        hub:     h,
+        conn:    conn,
+        room:    room,
+        send:    make(chan []byte, 64),
+        preload: pre,
     }
     h.join <- c
 

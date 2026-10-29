@@ -4,6 +4,7 @@ import (
     "context"
     "log"
     "net/http"
+    "time"
 
     "github.com/markandray/pulse/internal/hub"
     "github.com/markandray/pulse/internal/store"
@@ -18,6 +19,7 @@ func main() {
     log.Println("connected to mongo")
 
     h := hub.New()
+    h.EnablePersistence(st, time.Second)
     go h.Run()
 
     http.HandleFunc("/ws", h.ServeWS)
