@@ -1,0 +1,5 @@
+.git
+.vscode
+.DS_Store
+DECISIONS.md
+docker-compose.yml

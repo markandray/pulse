@@ -235,6 +235,25 @@ size grows with the board. In exchange there is no history to retain and no
 catch-up edge cases. Delta resync is the natural use of the week 3 event
 log. Input is ignored while offline (no queue), so actions taken during an
 outage are lost, not replayed.
+
+## 15. Containerized with a multi-stage build and env-based config
+
+**Context:** The service must run the same way on a laptop, in compose, and
+(week 4) in Kubernetes, where `localhost` no longer reaches the database.
+
+**Decision:** Configuration comes from environment variables (`MONGO_URI`,
+`ADDR`, `WEB_DIR`) with local-development defaults. The Dockerfile builds a
+static binary in a Go image and copies it with the web folder into a distroless
+non-root image. Compose waits for a Mongo healthcheck before starting the
+service, and Mongo data lives in a named volume.
+
+**Alternatives:** A single-stage image on a full Go base (about 1 GB, with the
+toolchain in production); config files baked into the image.
+
+**Trade-off:** The distroless image has no shell, so debugging inside the
+running container is harder. The static web files are baked into the image,
+so a UI change requires a rebuild.
+
 ---
 
 ## Known gaps and future work

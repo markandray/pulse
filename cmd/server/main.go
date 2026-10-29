@@ -4,14 +4,22 @@ import (
     "context"
     "log"
     "net/http"
+    "os"
     "time"
 
     "github.com/markandray/pulse/internal/hub"
     "github.com/markandray/pulse/internal/store"
 )
 
+func env(key, def string) string {
+    if v := os.Getenv(key); v != "" {
+        return v
+    }
+    return def
+}
+
 func main() {
-    st, err := store.New(context.Background(), "mongodb://localhost:27017")
+    st, err := store.New(context.Background(), env("MONGO_URI", "mongodb://localhost:27017"))
     if err != nil {
         log.Fatal("mongo: ", err)
     }
@@ -23,8 +31,9 @@ func main() {
     go h.Run()
 
     http.HandleFunc("/ws", h.ServeWS)
-    http.Handle("/", http.FileServer(http.Dir("web")))
+    http.Handle("/", http.FileServer(http.Dir(env("WEB_DIR", "web"))))
 
-    log.Println("listening on :8080")
-    log.Fatal(http.ListenAndServe(":8080", nil))
+    addr := env("ADDR", ":8080")
+    log.Println("listening on", addr)
+    log.Fatal(http.ListenAndServe(addr, nil))
 }
