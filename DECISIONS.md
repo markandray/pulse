@@ -1,0 +1,230 @@
+# Decisions
+
+Architecture decisions for Pulse, a realtime collaborative whiteboard.
+Each entry: context, decision, alternatives considered, trade-off.
+
+Status: Week 2 in progress (persistence done, reconnect/resync next).
+
+---
+
+## 1. Hub goroutine owns all room state
+
+**Context:** Many connection goroutines need to join, leave, and broadcast to
+shared rooms.
+
+**Decision:** A single hub goroutine owns the `rooms` and `boards` maps.
+Connections talk to it only through channels (`join`, `leave`, `broadcast`),
+so no `sync.Mutex` is needed.
+
+**Alternatives:** A mutex-guarded shared map.
+
+**Trade-off:** All room operations serialize through one goroutine. That is
+fine at this scale, but it is the first thing to check under load in week 5,
+and it becomes a real constraint when multiple instances run in week 3.
+
+## 2. One reader and one writer goroutine per connection
+
+**Context:** gorilla/websocket allows only one concurrent writer per
+connection.
+
+**Decision:** Each client has a `readPump` and a `writePump`. The hub never
+writes to a connection directly; it pushes bytes into the client's buffered
+`send` channel (64), and `writePump` drains it.
+
+**Alternatives:** Locking around `conn.WriteMessage`.
+
+**Trade-off:** Two goroutines per client and a buffer to size. In exchange,
+writes are serialized for free and a slow client is detectable (decision 3).
+
+## 3. Drop slow clients instead of blocking
+
+**Context:** If the hub blocks on one client's full `send` channel, every
+room freezes.
+
+**Decision:** Broadcast uses a non-blocking send. If a client's buffer is
+full, the hub removes it and closes its channel.
+
+**Alternatives:** Block until the client catches up; drop only the message;
+use an unbounded queue per client.
+
+**Trade-off:** A client that stalls briefly gets disconnected and must
+reconnect and resync, which is why reconnect/resync is a week 2 goal.
+`remove` checks room membership first, so a client dropped for being slow
+is not closed twice when its `readPump` later calls `leave`.
+
+## 4. Heartbeats and read limits
+
+**Context:** A client that vanishes without closing (lid closed, wifi lost)
+would hold goroutines and a hub slot until TCP times out, which can take
+minutes.
+
+**Decision:** The server pings every 27 seconds. Each pong extends the read
+deadline to 30 seconds. Writes have a 10-second deadline. Incoming messages
+are capped at 8 KB.
+
+**Alternatives:** Rely on TCP keepalive; application-level heartbeat
+messages.
+
+**Trade-off:** Some constant tuning, and the 8 KB cap must be revisited if
+messages grow (for example batched strokes or large shapes).
+
+## 5. Server sequences events (replaces "server relays opaque bytes")
+
+**Status:** Supersedes the week 1 design where the server relayed raw bytes
+without parsing.
+
+**Context:** With a pure relay, ordering depended on which message happened
+to arrive last, different clients could see different orders, and the server
+could not persist or replay anything.
+
+**Decision:** The server parses `add`, `move`, and `delete`, assigns each a
+per-room sequence number (`seq`), applies it to its own `Board`, and
+broadcasts it to everyone, including the sender. Clients apply shape changes
+only when the server echoes them.
+
+**Alternatives:** Client-side timestamps; CRDTs (out of scope for this
+project).
+
+**Trade-off:** Conflicts are still last-write-wins, but "last" now means last
+processed by the server, which is the same order for every client.
+Shape actions wait for a server round trip (invisible on localhost), and all
+sequencing goes through one goroutine per instance. The multi-instance
+problem is what week 3 has to solve.
+
+## 6. Freehand strokes are ephemeral
+
+**Context:** Pen strokes are very high volume (one message per mouse move)
+and are not objects with identity.
+
+**Decision:** `seg` messages are relayed as raw bytes to others in the room.
+They are not sequenced, applied to the board, or persisted.
+
+**Alternatives:** Persist every segment; group a stroke into one object when
+the pen is released.
+
+**Trade-off:** Strokes disappear on refresh and are not visible to late
+joiners. Fixing this properly means treating a whole stroke as one shape.
+
+## 7. Client-generated shape IDs
+
+**Context:** Shapes need stable identity so `move` and `delete` can refer to
+them.
+
+**Decision:** The client creates IDs with `crypto.randomUUID()`.
+
+**Alternatives:** Server-assigned IDs.
+
+**Trade-off:** No round trip is needed to create an ID, but the server cannot
+enforce uniqueness and trusts the client. A move or delete for a shape that
+no longer exists is ignored, not treated as an error.
+
+## 8. Validate events before they reach the hub
+
+**Context:** A panic inside the hub goroutine would take down every room, for
+example `add` with no shape.
+
+**Decision:** `readPump` unmarshals and validates each message. Malformed
+messages and unknown types are dropped silently. Only valid events reach the
+hub.
+
+**Alternatives:** Validate inside the hub.
+
+**Trade-off:** Parsing runs in parallel in each client's goroutine, which
+keeps work off the hub, but the validation rules live in the client file
+rather than next to `Board.Apply`.
+
+## 9. Snapshot on join
+
+**Context:** Late joiners and reconnecting clients saw a blank board.
+
+**Decision:** When a client joins, the hub sends one `snapshot` message
+(current `seq` plus all shapes) as the first message on its `send` channel,
+before any live event can reach it.
+
+**Alternatives:** Replay the full event history; let the client request state
+on demand.
+
+**Trade-off:** A full snapshot is simple, but its size grows with the board.
+Shape order comes from map iteration, so z-order is not stable across
+reloads (see known gaps).
+
+## 10. Load persisted boards when clients join
+
+When persistence is enabled, `ServeWS` loads the requested room before
+upgrading the WebSocket and passes the result to the hub as a preload. The
+hub uses it only if the room is not already in memory, because memory is
+newer than the database.
+
+If the load fails, the connection is rejected with 503. Otherwise an empty
+board could take over the room and overwrite the real saved board on the
+next save.
+
+The load happens before the upgrade so the hub goroutine never waits on a
+database read.
+
+This currently performs one storage read for every join, including rooms
+whose boards are already in memory. That is acceptable at the current scale;
+a future optimization could avoid repeated reads for in-memory rooms.
+
+## 11. Persist debounced board snapshots
+
+The hub saves dirty board snapshots on a one-second interval instead of
+writing every event to MongoDB. This reduces database load, but a crash can
+lose up to one interval of edits. Week 3's Kafka log is the intended durable
+event-log solution.
+
+The hub sends the persister a copy of the board, not the live one. The hub
+keeps mutating its own maps, so sharing them with the persister would be a
+data race.
+
+Failed saves are logged but not retried until the room changes again. A small
+future improvement is to mark the room dirty again after a failed save.
+
+There is no graceful shutdown flush yet, so Ctrl+C can drop edits from the
+last interval. Flushing on SIGINT is a small follow-up task.
+
+The persister processes snapshots in one goroutine, serializing writes so an
+older snapshot cannot overwrite a newer one.
+
+## 12. Hub depends on a `Store` interface
+
+**Context:** `store` needs the `Board` and `Shape` types from `hub`, so `hub`
+importing `store` would be an import cycle.
+
+**Decision:** `hub` declares a small `Store` interface (`Load`, `Save`) and
+the MongoDB implementation satisfies it, with a compile-time check in
+`store`.
+
+**Alternatives:** Move shared types into a third package.
+
+**Trade-off:** The interface lives where it is used (idiomatic Go), and tests
+use a fake store with no database. Persistence is optional: with no store the
+hub works in memory only.
+
+## 13. Testing concurrent code without sleeps
+
+**Context:** An early hub test passed or failed depending on goroutine
+scheduling (the broadcast channel is buffered, so the test raced the hub).
+
+**Decision:** Tests use a healthy "probe" client as a barrier. The hub handles
+messages in FIFO order, so once the probe has received the last message, the
+earlier ones are guaranteed to be processed. The suite runs with
+`go test -race -count=50`.
+
+**Alternatives:** `time.Sleep` in tests.
+
+**Trade-off:** Slightly more test setup, but no timing guesses and no flaky
+tests.
+
+---
+
+## Known gaps and future work
+
+- Z-order is unstable after reload because snapshots come from map iteration.
+  Fix: store a creation `seq` on each shape and sort by it.
+- One message per mouse move, and a full redraw on every event. Candidates:
+  batching, and `requestAnimationFrame` rendering.
+- Boards stay in the hub's memory after their room empties, so memory grows.
+  Fix: evict after a final save.
+- No retry for failed saves, and no flush on shutdown (see decision 11).
+- No reconnect/resync yet (week 2), and no multi-instance fan-out (week 3).
