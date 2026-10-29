@@ -276,6 +276,30 @@ which only the week 3 event log can fix. The flush interval is configurable
 (`PERSIST_INTERVAL`), so the test can prove the final flush is the one that
 saved the data.
 
+## 17. Two layers of tests
+
+**Context:** Concurrency bugs live in the interaction between goroutines, but
+unit tests with fake clients cannot see the WebSocket handler, the pumps, or
+the JSON validation.
+
+**Decision:** Hub unit tests use fake clients and a fake store to check
+broadcast, backpressure, sequencing, persistence and shutdown deterministically.
+Integration tests run the real `ServeWS` on a random port through
+`httptest` with real gorilla clients, and cover ordering, late-join snapshots,
+room isolation, reconnect, malformed input, the message-size limit, and
+shutdown. The integration tests live in an external `hub_test` package, so they
+can only use the exported API. Everything runs with `-race`.
+
+**Alternatives:** Only end-to-end tests against the Docker stack; mocking the
+WebSocket connection.
+
+**Trade-off:** The tests avoid timing assumptions by treating the join
+snapshot as a "you are registered" signal and by proving isolation through
+event ordering instead of waiting for silence. The cost is that a few tests
+depend on the exact join protocol, so a change to it means updating them.
+Mongo itself is not covered here: persistence is tested against a fake store,
+so the real driver path is only exercised by the manual Docker checks.
+
 ---
 
 ## Known gaps and future work
