@@ -27,7 +27,10 @@ type Client struct {
 
 func (c *Client) readPump() {
     defer func() {
-        c.hub.leave <- c
+        select {
+        case c.hub.leave <- c:
+        case <-c.hub.done:
+        }
         c.conn.Close()
     }()
     c.conn.SetReadLimit(maxMessageSize)
@@ -62,7 +65,11 @@ func (c *Client) readPump() {
         default:
             continue
         }
-        c.hub.broadcast <- msg
+        select {
+        case c.hub.broadcast <- msg:
+        case <-c.hub.done:
+            return
+        }
     }
 }
 
@@ -129,7 +136,12 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
         send:    make(chan []byte, 64),
         preload: pre,
     }
-    h.join <- c
+    select {
+    case h.join <- c:
+    case <-h.done:
+        conn.Close()
+        return
+    }
 
     go c.writePump()
     c.readPump() // blocks until the connection closes

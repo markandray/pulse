@@ -20,11 +20,14 @@ type Store interface {
 }
 
 type Hub struct {
-    rooms     map[string]map[*Client]struct{}
-    boards    map[string]*Board
-    join      chan *Client
-    leave     chan *Client
-    broadcast chan Message
+    rooms       map[string]map[*Client]struct{}
+    boards      map[string]*Board
+    join        chan *Client
+    leave       chan *Client
+    broadcast   chan Message
+    quit        chan chan struct{}
+    done        chan struct{}
+    persistDone chan struct{}
 
     store    Store
     interval time.Duration
@@ -39,6 +42,8 @@ func New() *Hub {
         join:      make(chan *Client),
         leave:     make(chan *Client),
         broadcast: make(chan Message, 256),
+        quit:      make(chan chan struct{}),
+        done:      make(chan struct{}),
     }
 }
 
@@ -57,10 +62,12 @@ func (h *Hub) EnablePersistence(s Store, every time.Duration) {
     h.interval = every
     h.persist = make(chan *Board, 64)
     h.dirty = map[string]struct{}{}
+    h.persistDone = make(chan struct{})
     go h.persister()
 }
 
 func (h *Hub) persister() {
+    defer close(h.persistDone)
     for b := range h.persist {
         ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
         if err := h.store.Save(ctx, b); err != nil {
@@ -70,18 +77,48 @@ func (h *Hub) persister() {
     }
 }
 
+func (h *Hub) snapshotOf(room string) *Board {
+    b := h.boards[room]
+    cp := &Board{Room: b.Room, Seq: b.Seq, Shapes: make(map[string]Shape, len(b.Shapes))}
+    for k, v := range b.Shapes {
+        cp.Shapes[k] = v
+    }
+    return cp
+}
+
 func (h *Hub) flush() {
     for room := range h.dirty {
-        b := h.boards[room]
-        cp := &Board{Room: b.Room, Seq: b.Seq, Shapes: make(map[string]Shape, len(b.Shapes))}
-        for k, v := range b.Shapes {
-            cp.Shapes[k] = v
-        }
         select {
-        case h.persist <- cp:
+        case h.persist <- h.snapshotOf(room):
             delete(h.dirty, room)
         default: // persister busy, retry next tick
         }
+    }
+}
+
+func (h *Hub) flushAll() {
+    for room := range h.dirty {
+        h.persist <- h.snapshotOf(room)
+        delete(h.dirty, room)
+    }
+}
+
+func (h *Hub) Shutdown(ctx context.Context) error {
+    ack := make(chan struct{})
+    select {
+    case <-h.done:
+        return nil
+    case h.quit <- ack:
+    case <-ctx.Done():
+        return ctx.Err()
+    }
+    select {
+    case <-ack:
+        return nil
+    case <-h.done:
+        return nil
+    case <-ctx.Done():
+        return ctx.Err()
     }
 }
 
@@ -152,6 +189,20 @@ func (h *Hub) Run() {
             }
         case <-tick:
             h.flush()
+        case ack := <-h.quit:
+            for _, clients := range h.rooms {
+                for c := range clients {
+                    h.remove(c)
+                }
+            }
+            if h.persist != nil {
+                h.flushAll()
+                close(h.persist)
+                <-h.persistDone
+            }
+            close(h.done)
+            close(ack)
+            return
         }
     }
 }

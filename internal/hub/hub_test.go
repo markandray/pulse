@@ -177,7 +177,7 @@ func TestRejoinGetsCurrentSnapshot(t *testing.T) {
     recv(t, a) // snapshot
     h.broadcast <- Message{Room: "r1", From: a,
         Event: &Event{Type: "add", Shape: &Shape{ID: "s1", Kind: "rect"}}}
-    recv(t, a) // echo of its own add
+    recv(t, a)   // echo of its own add
     h.leave <- a // room is now empty
 
     b := newTestClient(h, "r1", 8)
@@ -193,5 +193,37 @@ func TestRejoinGetsCurrentSnapshot(t *testing.T) {
     }
     if snap.Type != "snapshot" || snap.Seq != 1 || len(snap.Shapes) != 1 {
         t.Fatalf("got %+v", snap)
+    }
+}
+
+func TestShutdownFlushesDirtyBoards(t *testing.T) {
+    h := New()
+    fs := &fakeStore{saved: make(chan *Board, 4)}
+    h.EnablePersistence(fs, time.Hour)
+    go h.Run()
+
+    a := newTestClient(h, "r1", 8)
+    h.join <- a
+    recv(t, a)
+    h.broadcast <- Message{Room: "r1", From: a,
+        Event: &Event{Type: "add", Shape: &Shape{ID: "s1", Kind: "rect"}}}
+    recv(t, a)
+
+    ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+    defer cancel()
+    if err := h.Shutdown(ctx); err != nil {
+        t.Fatal(err)
+    }
+
+    if _, ok := <-a.send; ok {
+        t.Fatal("expected client channel to be closed")
+    }
+    select {
+    case b := <-fs.saved:
+        if b.Seq != 1 || len(b.Shapes) != 1 {
+            t.Fatalf("saved seq=%d shapes=%d", b.Seq, len(b.Shapes))
+        }
+    default:
+        t.Fatal("dirty board was not persisted during shutdown")
     }
 }

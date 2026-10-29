@@ -180,8 +180,8 @@ data race.
 Failed saves are logged but not retried until the room changes again. A small
 future improvement is to mark the room dirty again after a failed save.
 
-There is no graceful shutdown flush yet, so Ctrl+C can drop edits from the
-last interval. Flushing on SIGINT is a small follow-up task.
+Graceful shutdown now flushes dirty boards on SIGINT/SIGTERM. A hard kill, OOM,
+or crash can still lose edits from the last interval.
 
 The persister processes snapshots in one goroutine, serializing writes so an
 older snapshot cannot overwrite a newer one.
@@ -254,6 +254,28 @@ toolchain in production); config files baked into the image.
 running container is harder. The static web files are baked into the image,
 so a UI change requires a rebuild.
 
+## 16. Graceful shutdown with a final flush
+
+**Context:** Deploys and `docker stop` send SIGTERM. Without handling it, the
+last interval of edits is lost, and clients see an abrupt TCP drop.
+
+**Decision:** On SIGINT/SIGTERM the process first stops the HTTP listener, then
+shuts down the hub. The hub closes every client (so each receives a WebSocket
+close frame), synchronously hands all dirty boards to the persister, and waits
+for the persister to finish its last save. The process uses a shared 8-second
+shutdown deadline, below Docker's default 10-second stop grace period. After the hub exits, its
+`done` channel releases any goroutine still trying to send to it.
+
+**Alternatives:** Rely on the periodic flush and accept losing up to one
+interval on every deploy; write every event to the database synchronously.
+
+**Trade-off:** `http.Server.Shutdown` does not wait for hijacked WebSocket
+connections, so the hub needs its own shutdown path and ordering has to be
+explicit. A hard kill, OOM, or crash still loses up to one interval of edits,
+which only the week 3 event log can fix. The flush interval is configurable
+(`PERSIST_INTERVAL`), so the test can prove the final flush is the one that
+saved the data.
+
 ---
 
 ## Known gaps and future work
@@ -264,4 +286,4 @@ so a UI change requires a rebuild.
   batching, and `requestAnimationFrame` rendering.
 - Boards stay in the hub's memory after their room empties, so memory grows.
   Fix: evict after a final save.
-- No retry for failed saves, and no flush on shutdown (see decision 11).
+- No retry for failed saves (see decision 11).
