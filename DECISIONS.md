@@ -216,6 +216,25 @@ earlier ones are guaranteed to be processed. The suite runs with
 **Trade-off:** Slightly more test setup, but no timing guesses and no flaky
 tests.
 
+## 14. Reconnect with full-snapshot resync
+
+**Context:** Clients get disconnected (server restart, dropped network, slow
+client dropped by the hub) and must recover without a manual refresh.
+
+**Decision:** The browser reconnects automatically with exponential backoff
+(0.5s doubling to a 10s cap) and jitter. A reconnecting client is treated as
+a new client, so the hub sends it a full snapshot, which replaces its state.
+The client tracks the last `seq` and forces a reconnect if it sees a gap.
+Backoff resets when a snapshot arrives, not when the socket opens.
+
+**Alternatives:** Client sends its last `seq` and the server replays only the
+missing events; this needs a bounded event history per room.
+
+**Trade-off:** A full snapshot costs more bandwidth than a delta, and its
+size grows with the board. In exchange there is no history to retain and no
+catch-up edge cases. Delta resync is the natural use of the week 3 event
+log. Input is ignored while offline (no queue), so actions taken during an
+outage are lost, not replayed.
 ---
 
 ## Known gaps and future work
@@ -227,4 +246,3 @@ tests.
 - Boards stay in the hub's memory after their room empties, so memory grows.
   Fix: evict after a final save.
 - No retry for failed saves, and no flush on shutdown (see decision 11).
-- No reconnect/resync yet (week 2), and no multi-instance fan-out (week 3).

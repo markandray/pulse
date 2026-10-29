@@ -106,16 +106,47 @@ function apply(msg) {
   render();
 }
 
-// ---------- websocket ----------
-const ws = new WebSocket(`ws://localhost:8080/ws?room=${room}`);
+// ---------- websocket with auto-reconnect ----------
 const status = document.getElementById("status");
-ws.onopen = () => status.textContent = "connected";
-ws.onclose = () => status.textContent = "disconnected";
-ws.onmessage = (e) => apply(JSON.parse(e.data));
+let ws = null;
+let retry = 0;
+
+function connect() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const sock = new WebSocket(`${proto}://${location.host}/ws?room=${room}`);
+  ws = sock;
+
+  sock.onopen = () => { status.textContent = "connected"; };
+
+  sock.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === "snapshot") {
+      retry = 0;                       // a full round trip worked
+    } else if (msg.seq && msg.seq !== lastSeq + 1) {
+      sock.close();                    // missed an event: reconnect and resync
+      return;
+    }
+    apply(msg);
+    if (msg.seq) lastSeq = msg.seq;
+  };
+
+  sock.onclose = () => {
+    if (sock !== ws) return;           // a newer socket already replaced this one
+    drag = null;
+    preview = null;
+    const base = Math.min(10000, 500 * 2 ** retry);
+    const delay = base * (0.5 + Math.random() / 2);   // jitter
+    retry++;
+    status.textContent = `disconnected, retrying in ${(delay / 1000).toFixed(1)}s`;
+    setTimeout(connect, delay);
+  };
+}
+connect();
 
 function emit(msg) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;   // offline: ignore input
   if (msg.type === "seg") apply(msg);   // ephemeral: draw immediately
-  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+  ws.send(JSON.stringify(msg));
 }
 
 // ---------- toolbar ----------

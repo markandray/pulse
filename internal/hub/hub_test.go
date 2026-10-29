@@ -167,3 +167,31 @@ func TestPreloadedBoardIsServedOnJoin(t *testing.T) {
         t.Fatalf("snapshot seq=%d shapes=%d", snap.Seq, len(snap.Shapes))
     }
 }
+
+func TestRejoinGetsCurrentSnapshot(t *testing.T) {
+    h := New()
+    go h.Run()
+
+    a := newTestClient(h, "r1", 8)
+    h.join <- a
+    recv(t, a) // snapshot
+    h.broadcast <- Message{Room: "r1", From: a,
+        Event: &Event{Type: "add", Shape: &Shape{ID: "s1", Kind: "rect"}}}
+    recv(t, a) // echo of its own add
+    h.leave <- a // room is now empty
+
+    b := newTestClient(h, "r1", 8)
+    h.join <- b
+
+    var snap struct {
+        Type   string  `json:"type"`
+        Seq    uint64  `json:"seq"`
+        Shapes []Shape `json:"shapes"`
+    }
+    if err := json.Unmarshal(recv(t, b), &snap); err != nil {
+        t.Fatal(err)
+    }
+    if snap.Type != "snapshot" || snap.Seq != 1 || len(snap.Shapes) != 1 {
+        t.Fatalf("got %+v", snap)
+    }
+}
