@@ -105,7 +105,7 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
     }
 
     var pre *Board
-    if h.store != nil {
+    if h.store != nil && h.events == nil {
         ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
         b, err := h.store.Load(ctx, room)
         cancel()

@@ -3,6 +3,7 @@ package hub
 import (
     "context"
     "encoding/json"
+    "errors"
     "testing"
     "time"
 )
@@ -111,13 +112,30 @@ func TestEventsGetSequenceAndEchoToSender(t *testing.T) {
     }
 }
 
+type checkpointCall struct {
+    boards  []*Board
+    offsets map[int32]int64
+}
+
 type fakeStore struct {
-    saved chan *Board
+    saved       chan *Board
+    checkpoints chan checkpointCall
+    failures    int
 }
 
 func (f *fakeStore) Load(ctx context.Context, room string) (*Board, error) { return nil, nil }
+
 func (f *fakeStore) Save(ctx context.Context, b *Board) error {
+    if f.failures > 0 {
+        f.failures--
+        return errors.New("injected failure")
+    }
     f.saved <- b
+    return nil
+}
+
+func (f *fakeStore) SaveCheckpoint(ctx context.Context, boards []*Board, offsets map[int32]int64) error {
+    f.checkpoints <- checkpointCall{boards: boards, offsets: offsets}
     return nil
 }
 
@@ -248,6 +266,10 @@ func mustJSON(t *testing.T, v any) []byte {
     return b
 }
 
+func addJSON(t *testing.T, id string) []byte {
+    return mustJSON(t, Event{Type: "add", Shape: &Shape{ID: id, Kind: "rect"}})
+}
+
 type snapshotMsg struct {
     Type   string  `json:"type"`
     Seq    uint64  `json:"seq"`
@@ -334,5 +356,83 @@ func TestBadLogRecordsAreSkippedWithoutConsumingSeq(t *testing.T) {
     s := joinAndSnapshot(t, h, "r1")
     if s.Seq != 1 || len(s.Shapes) != 1 {
         t.Fatalf("board = %+v; poison records should be skipped and seq stay dense", s)
+    }
+}
+
+func TestRestoreSkipsEventsAlreadyInSnapshot(t *testing.T) {
+    h := New()
+    b := NewBoard("r1")
+    b.Seq, b.Partition, b.Offset = 3, 0, 5
+    b.Shapes["s1"] = Shape{ID: "s1", Kind: "rect"}
+    // The checkpoint is older than the board: a crash happened after the board
+    // was written but before the checkpoint advanced.
+    h.Restore([]*Board{b}, map[int32]int64{0: 3})
+    go h.Run()
+
+    h.Deliver("r1", addJSON(t, "s2"), 0, 4) // already reflected in the snapshot
+    h.Deliver("r1", addJSON(t, "s3"), 0, 5) // already reflected in the snapshot
+    h.Deliver("r1", addJSON(t, "s4"), 0, 6) // genuinely new
+
+    s := joinAndSnapshot(t, h, "r1")
+    ids := map[string]bool{}
+    for _, sh := range s.Shapes {
+        ids[sh.ID] = true
+    }
+    if s.Seq != 4 || len(ids) != 2 || !ids["s1"] || !ids["s4"] {
+        t.Fatalf("board = seq %d, shapes %v; want seq 4 with s1 and s4 only", s.Seq, ids)
+    }
+}
+
+func TestLogModeWritesBoardsAndOffsetsTogether(t *testing.T) {
+    h := New()
+    h.SetEventLog(&fakeLog{published: make(chan published, 1)})
+    fs := &fakeStore{saved: make(chan *Board, 4), checkpoints: make(chan checkpointCall, 16)}
+    h.EnablePersistence(fs, 10*time.Millisecond)
+    go h.Run()
+
+    h.Deliver("r1", addJSON(t, "s1"), 2, 0)
+    h.Deliver("r1", addJSON(t, "s2"), 2, 1)
+
+    deadline := time.After(time.Second)
+    for {
+        select {
+        case cp := <-fs.checkpoints:
+            if cp.offsets[2] != 1 {
+                continue // an earlier tick, before both events were applied
+            }
+            if len(cp.boards) != 1 {
+                t.Fatalf("got %d boards in the batch, want 1", len(cp.boards))
+            }
+            b := cp.boards[0]
+            if b.Room != "r1" || b.Seq != 2 || b.Partition != 2 || b.Offset != 1 {
+                t.Fatalf("saved board = %+v", b)
+            }
+            return
+        case <-deadline:
+            t.Fatal("no checkpoint covering offset 1 was written")
+        }
+    }
+}
+
+func TestFailedSaveIsRetried(t *testing.T) {
+    h := New()
+    fs := &fakeStore{saved: make(chan *Board, 4), failures: 1}
+    h.EnablePersistence(fs, 10*time.Millisecond)
+    go h.Run()
+
+    a := newTestClient(h, "r1", 8)
+    h.join <- a
+    recv(t, a)
+    h.broadcast <- Message{Room: "r1", From: a,
+        Event: &Event{Type: "add", Shape: &Shape{ID: "s1", Kind: "rect"}}}
+    recv(t, a) // applied and marked dirty
+
+    select {
+    case b := <-fs.saved:
+        if b.Seq != 1 {
+            t.Fatalf("saved seq %d, want 1", b.Seq)
+        }
+    case <-time.After(time.Second):
+        t.Fatal("board was never saved after the first save failed")
     }
 }

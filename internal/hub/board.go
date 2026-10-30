@@ -22,13 +22,15 @@ type Event struct {
 }
 
 type Board struct {
-    Room   string           `bson:"_id"`
-    Seq    uint64           `bson:"seq"`
-    Shapes map[string]Shape `bson:"shapes"`
+    Room      string           `bson:"_id"`
+    Seq       uint64           `bson:"seq"`
+    Shapes    map[string]Shape `bson:"shapes"`
+    Partition int32            `bson:"partition"` // log partition this room lives in
+    Offset    int64            `bson:"offset"`    // board reflects every event in that partition up to here
 }
 
 func NewBoard(room string) *Board {
-    return &Board{Room: room, Shapes: map[string]Shape{}}
+    return &Board{Room: room, Shapes: map[string]Shape{}, Offset: -1}
 }
 
 func (b *Board) Apply(e *Event) {

@@ -17,6 +17,9 @@ type Message struct {
 type Store interface {
     Load(ctx context.Context, room string) (*Board, error)
     Save(ctx context.Context, b *Board) error
+    // SaveCheckpoint writes the boards first and the offsets last, so the
+    // offsets never run ahead of the boards.
+    SaveCheckpoint(ctx context.Context, boards []*Board, offsets map[int32]int64) error
 }
 
 // EventLog is the durable, ordered log of shape events (Kafka in production).
@@ -28,8 +31,20 @@ type EventLog interface {
 type record struct {
     room      string
     data      []byte
-    partition int32 // unused until step 3, when snapshots store them
+    partition int32
     offset    int64
+}
+
+// batch is one unit of work for the persister.
+type batch struct {
+    boards  []*Board
+    offsets map[int32]int64 // non-nil in log mode: the checkpoint written after the boards
+}
+
+type saveResult struct {
+    rooms   []string
+    offsets map[int32]int64
+    err     error
 }
 
 type Hub struct {
@@ -42,9 +57,16 @@ type Hub struct {
 
     events EventLog // nil means "no log": events are applied directly
 
+    // log mode: last offset consumed per partition, and the offsets covered
+    // by the last successful checkpoint
+    applied      map[int32]int64
+    checkpointed map[int32]int64
+
     store       Store
     interval    time.Duration
-    persist     chan *Board
+    persist     chan *batch
+    saved       chan saveResult
+    flushing    bool // a batch is with the persister
     dirty       map[string]struct{}
     quit        chan chan struct{}
     done        chan struct{} // closed when Run has exited
@@ -53,25 +75,39 @@ type Hub struct {
 
 func New() *Hub {
     return &Hub{
-        rooms:     map[string]map[*Client]struct{}{},
-        boards:    map[string]*Board{},
-        join:      make(chan *Client),
-        leave:     make(chan *Client),
-        broadcast: make(chan Message, 256),
-        records:   make(chan record), // unbuffered: Deliver returns once the hub has taken the record
-        quit:      make(chan chan struct{}),
-        done:      make(chan struct{}),
+        rooms:        map[string]map[*Client]struct{}{},
+        boards:       map[string]*Board{},
+        join:         make(chan *Client),
+        leave:        make(chan *Client),
+        broadcast:    make(chan Message, 256),
+        records:      make(chan record), // unbuffered: Deliver returns once the hub has taken the record
+        applied:      map[int32]int64{},
+        checkpointed: map[int32]int64{},
+        quit:         make(chan chan struct{}),
+        done:         make(chan struct{}),
     }
 }
 
 // SetEventLog switches the hub to log mode. Call before Run.
 func (h *Hub) SetEventLog(l EventLog) { h.events = l }
 
-// EnablePersistence turns on Mongo snapshots (non-log mode). Call before Run.
+// Restore loads boards and the checkpoint they were saved with. Call before Run.
+func (h *Hub) Restore(boards []*Board, offsets map[int32]int64) {
+    for _, b := range boards {
+        h.boards[b.Room] = b
+    }
+    for p, o := range offsets {
+        h.applied[p] = o
+        h.checkpointed[p] = o
+    }
+}
+
+// EnablePersistence turns on debounced snapshots to the store. Call before Run.
 func (h *Hub) EnablePersistence(s Store, every time.Duration) {
     h.store = s
     h.interval = every
-    h.persist = make(chan *Board, 64)
+    h.persist = make(chan *batch, 1)
+    h.saved = make(chan saveResult, 1)
     h.persistDone = make(chan struct{})
     h.dirty = map[string]struct{}{}
     go h.persister()
@@ -80,38 +116,93 @@ func (h *Hub) EnablePersistence(s Store, every time.Duration) {
 func (h *Hub) persister() {
     defer close(h.persistDone)
     for b := range h.persist {
-        ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-        if err := h.store.Save(ctx, b); err != nil {
-            log.Println("save:", err)
+        ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+        var err error
+        if b.offsets != nil {
+            err = h.store.SaveCheckpoint(ctx, b.boards, b.offsets)
+        } else {
+            for _, bd := range b.boards {
+                if err = h.store.Save(ctx, bd); err != nil {
+                    break
+                }
+            }
         }
         cancel()
+
+        rooms := make([]string, len(b.boards))
+        for i, bd := range b.boards {
+            rooms[i] = bd.Room
+        }
+        h.saved <- saveResult{rooms: rooms, offsets: b.offsets, err: err}
     }
 }
 
-func (h *Hub) snapshotOf(room string) *Board {
+func (h *Hub) copyBoard(room string) *Board {
     b := h.boards[room]
-    cp := &Board{Room: b.Room, Seq: b.Seq, Shapes: make(map[string]Shape, len(b.Shapes))}
+    cp := &Board{
+        Room: b.Room, Seq: b.Seq, Partition: b.Partition, Offset: b.Offset,
+        Shapes: make(map[string]Shape, len(b.Shapes)),
+    }
     for k, v := range b.Shapes {
         cp.Shapes[k] = v
     }
     return cp
 }
 
-func (h *Hub) flush() {
-    for room := range h.dirty {
-        select {
-        case h.persist <- h.snapshotOf(room):
-            delete(h.dirty, room)
-        default: // persister busy, retry next tick
-        }
+func copyOffsets(m map[int32]int64) map[int32]int64 {
+    cp := make(map[int32]int64, len(m))
+    for k, v := range m {
+        cp[k] = v
     }
+    return cp
 }
 
-// flushAll blocks until every dirty board is handed to the persister.
-func (h *Hub) flushAll() {
+func sameOffsets(a, b map[int32]int64) bool {
+    if len(a) != len(b) {
+        return false
+    }
+    for k, v := range a {
+        if w, ok := b[k]; !ok || w != v {
+            return false
+        }
+    }
+    return true
+}
+
+// buildBatch snapshots everything that needs saving, or returns nil.
+// Boards and offsets are copied at the same instant, inside the hub goroutine,
+// so each board really does reflect every event up to its partition's offset.
+func (h *Hub) buildBatch() *batch {
+    logMode := h.events != nil
+    if len(h.dirty) == 0 && (!logMode || sameOffsets(h.applied, h.checkpointed)) {
+        return nil
+    }
+    b := &batch{}
     for room := range h.dirty {
-        h.persist <- h.snapshotOf(room)
+        cp := h.copyBoard(room)
+        if logMode {
+            cp.Offset = h.applied[cp.Partition]
+        }
+        b.boards = append(b.boards, cp)
         delete(h.dirty, room)
+    }
+    if logMode {
+        b.offsets = copyOffsets(h.applied)
+    }
+    return b
+}
+
+func (h *Hub) handleSaved(r saveResult) {
+    h.flushing = false
+    if r.err != nil {
+        log.Println("save failed, will retry:", r.err)
+        for _, room := range r.rooms {
+            h.dirty[room] = struct{}{}
+        }
+        return // checkpoint stays where it was
+    }
+    if r.offsets != nil {
+        h.checkpointed = r.offsets
     }
 }
 
@@ -254,6 +345,8 @@ func (h *Hub) Run() {
             }
 
         case rec := <-h.records:
+            h.applied[rec.partition] = rec.offset // consumed, valid or not
+
             var ev Event
             if err := json.Unmarshal(rec.data, &ev); err != nil || !ev.Valid() {
                 // A poison pill in a permanent log must never crash the hub.
@@ -261,10 +354,23 @@ func (h *Hub) Run() {
                     rec.room, rec.partition, rec.offset)
                 continue
             }
+            b := h.board(rec.room)
+            if b.Partition == rec.partition && rec.offset <= b.Offset {
+                continue // already reflected in the snapshot this board was restored from
+            }
+            b.Partition, b.Offset = rec.partition, rec.offset
             h.applyEvent(rec.room, &ev)
 
         case <-tick:
-            h.flush()
+            if !h.flushing {
+                if b := h.buildBatch(); b != nil {
+                    h.flushing = true
+                    h.persist <- b
+                }
+            }
+
+        case r := <-h.saved:
+            h.handleSaved(r)
 
         case ack := <-h.quit:
             for _, clients := range h.rooms {
@@ -273,7 +379,13 @@ func (h *Hub) Run() {
                 }
             }
             if h.persist != nil {
-                h.flushAll()
+                if h.flushing {
+                    h.handleSaved(<-h.saved)
+                }
+                if b := h.buildBatch(); b != nil {
+                    h.persist <- b
+                    h.handleSaved(<-h.saved)
+                }
                 close(h.persist)
                 <-h.persistDone
             }

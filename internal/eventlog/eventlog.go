@@ -11,24 +11,21 @@ import (
 
 // Log is the durable event log, backed by one Kafka topic keyed by room.
 //
-// It consumes WITHOUT a consumer group: every instance reads every partition
-// from the beginning, which is both the fan-out and the replay mechanism.
+// Consumption uses no consumer group: every instance reads every partition,
+// starting from its own checkpoint, which is both fan-out and replay.
 type Log struct {
-    topic string
-    cl    *kgo.Client
-    ready chan struct{}
+    brokers []string
+    topic   string
+    cl      *kgo.Client // produces and administers; consuming uses its own client
+    ready   chan struct{}
 }
 
 func New(brokers []string, topic string) (*Log, error) {
-    cl, err := kgo.NewClient(
-        kgo.SeedBrokers(brokers...),
-        kgo.ConsumeTopics(topic),
-        kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
-    )
+    cl, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
     if err != nil {
         return nil, err
     }
-    return &Log{topic: topic, cl: cl, ready: make(chan struct{})}, nil
+    return &Log{brokers: brokers, topic: topic, cl: cl, ready: make(chan struct{})}, nil
 }
 
 // Publish queues an event for the room's partition and returns immediately.
@@ -51,35 +48,64 @@ func (l *Log) Flush(ctx context.Context) error { return l.cl.Flush(ctx) }
 
 func (l *Log) Close() { l.cl.Close() }
 
-// Consume delivers every record, in per-partition order, until ctx ends.
-func (l *Log) Consume(ctx context.Context,
+// Consume delivers every record after the checkpoint (start[partition] is the
+// last offset already reflected in the snapshots), in per-partition order,
+// until ctx ends.
+func (l *Log) Consume(ctx context.Context, start map[int32]int64,
     deliver func(room string, data []byte, partition int32, offset int64)) error {
 
-    // Remember where the log ended when we started: that is the replay target.
     ends, err := kadm.NewClient(l.cl).ListEndOffsets(ctx, l.topic)
     if err != nil {
         return fmt.Errorf("list end offsets: %w", err)
     }
-    pending := map[int32]int64{} // partition -> last offset we must deliver
-    var listErr error
+
+    parts := map[int32]kgo.Offset{}
+    pending := map[int32]int64{} // partition -> last offset we must deliver before we are "ready"
+    var bad error
     ends.Each(func(o kadm.ListedOffset) {
-        if o.Err != nil {
-            listErr = o.Err
+        if bad != nil {
             return
         }
-        if o.Offset > 0 {
+        if o.Err != nil {
+            bad = o.Err
+            return
+        }
+        from := int64(0)
+        if s, ok := start[o.Partition]; ok {
+            from = s + 1
+        }
+        if from > o.Offset {
+            bad = fmt.Errorf("partition %d: checkpoint is at offset %d but the log ends at %d; "+
+                "was the topic recreated? drop the log_boards and log_checkpoint collections",
+                o.Partition, from-1, o.Offset)
+            return
+        }
+        parts[o.Partition] = kgo.NewOffset().At(from)
+        if o.Offset > from {
             pending[o.Partition] = o.Offset - 1
         }
     })
-    if listErr != nil {
-        return fmt.Errorf("list end offsets: %w", listErr)
+    if bad != nil {
+        return bad
     }
+
+    cons, err := kgo.NewClient(
+        kgo.SeedBrokers(l.brokers...),
+        kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{l.topic: parts}),
+    )
+    if err != nil {
+        return err
+    }
+    defer cons.Close()
+
+    replayed := 0
     if len(pending) == 0 {
-        close(l.ready) // empty log: nothing to replay
+        log.Println("eventlog: replayed 0 records (nothing after the checkpoint)")
+        close(l.ready)
     }
 
     for {
-        fetches := l.cl.PollFetches(ctx)
+        fetches := cons.PollFetches(ctx)
         if ctx.Err() != nil || fetches.IsClientClosed() {
             return nil
         }
@@ -88,9 +114,11 @@ func (l *Log) Consume(ctx context.Context,
         }
         fetches.EachRecord(func(r *kgo.Record) {
             deliver(string(r.Key), r.Value, r.Partition, r.Offset)
+            replayed++
             if last, ok := pending[r.Partition]; ok && r.Offset >= last {
                 delete(pending, r.Partition)
                 if len(pending) == 0 {
+                    log.Printf("eventlog: replayed %d records", replayed)
                     close(l.ready)
                 }
             }

@@ -330,6 +330,36 @@ is replayed), unbounded topic growth, and a failed publish that simply drops
 the action (it is logged, and the client never sees an echo). Freehand strokes
 still use a local relay, so they do not reach other instances yet.
 
+## 19. Snapshots with log offsets bound the replay; failed saves retry
+
+**Context:** Replaying the entire log on startup gets slower with every event
+ever drawn.
+
+**Decision:** Boards are still snapshotted to MongoDB on the debounce
+interval, and each saved board records the partition and offset it reflects.
+A batch writes the changed boards first and a single checkpoint document
+(partition -> offset) last. On startup the hub restores the boards, and the
+consumer resumes each partition just after its checkpoint. Replayed events at or
+below a board's own offset are skipped, so a crash between the board writes and
+the checkpoint write can never apply an event twice. Boards and offsets are
+copied at the same instant inside the hub goroutine, so each snapshot is
+consistent. A failed save keeps the checkpoint where it was and marks the
+rooms dirty again, so it is retried on the next tick. If the checkpoint is
+ahead of the log (for example the topic was recreated), startup fails loudly.
+
+**Alternatives:** Always replay from the start; MongoDB transactions (not
+available on a standalone server); snapshots keyed by a single global offset
+(offsets are per partition).
+
+**Trade-off:** Startup time depends on the time since the last checkpoint, not
+on the age of the log, and the log stays the source of truth: a lost or stale
+snapshot only costs replay time. The price is more moving parts and an
+ordering argument to maintain. The partition count of the topic must never
+change, because it would remap room keys to different partitions and break
+both ordering and the per-board offsets. Snapshots assume a single writer;
+with two instances an older snapshot can overwrite a newer one, which step 5
+must fix.
+
 ---
 
 ## Known gaps and future work
@@ -340,4 +370,3 @@ still use a local relay, so they do not reach other instances yet.
   batching, and `requestAnimationFrame` rendering.
 - Boards stay in the hub's memory after their room empties, so memory grows.
   Fix: evict after a final save.
-- No retry for failed saves (see decision 11).
