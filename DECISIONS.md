@@ -78,18 +78,17 @@ to arrive last, different clients could see different orders, and the server
 could not persist or replay anything.
 
 **Decision:** The server parses `add`, `move`, and `delete`, assigns each a
-per-room sequence number (`seq`), applies it to its own `Board`, and
-broadcasts it to everyone, including the sender. Clients apply shape changes
-only when the server echoes them.
+per-room sequence number (`seq`) when the event is consumed from the log (see
+decision 18), applies it to its own `Board`, and broadcasts it to everyone,
+including the sender. Clients apply shape changes only when the server echoes
+them.
 
 **Alternatives:** Client-side timestamps; CRDTs (out of scope for this
 project).
 
 **Trade-off:** Conflicts are still last-write-wins, but "last" now means last
-processed by the server, which is the same order for every client.
-Shape actions wait for a server round trip (invisible on localhost), and all
-sequencing goes through one goroutine per instance. The multi-instance
-problem is what week 3 has to solve.
+consumed from the log, which is the same order for every instance.
+Shape actions wait for a server round trip (invisible on localhost).
 
 ## 6. Freehand strokes are ephemeral
 
@@ -228,12 +227,13 @@ The client tracks the last `seq` and forces a reconnect if it sees a gap.
 Backoff resets when a snapshot arrives, not when the socket opens.
 
 **Alternatives:** Client sends its last `seq` and the server replays only the
-missing events; this needs a bounded event history per room.
+missing events; this needs a bounded event history per room. This delta-resync
+idea was realised in step 3 using the event log.
 
 **Trade-off:** A full snapshot costs more bandwidth than a delta, and its
 size grows with the board. In exchange there is no history to retain and no
-catch-up edge cases. Delta resync is the natural use of the week 3 event
-log. Input is ignored while offline (no queue), so actions taken during an
+catch-up edge cases. The event log now supports delta resync, realised in
+step 3. Input is ignored while offline (no queue), so actions taken during an
 outage are lost, not replayed.
 
 ## 15. Containerized with a multi-stage build and env-based config
@@ -299,6 +299,36 @@ event ordering instead of waiting for silence. The cost is that a few tests
 depend on the exact join protocol, so a change to it means updating them.
 Mongo itself is not covered here: persistence is tested against a fake store,
 so the real driver path is only exercised by the manual Docker checks.
+
+## 18. The Kafka log is the source of truth; seq is assigned on consume
+
+**Context:** One hub instance assigning `seq` works, but two instances would
+each assign their own, and snapshot persistence can lose recent edits.
+
+**Decision:** Validated shape events are published to a single Kafka topic keyed
+by room, so each room's events land in one partition and keep their order. The
+hub applies an event only when it comes back from the log: it assigns the
+room's next `seq`, applies it, and broadcasts to every client in the room,
+including the sender. Because every instance reads the same ordered stream
+and counts the same way, instances agree on `seq` without coordinating. Each
+instance consumes without a consumer group, from the beginning of every
+partition, so it both receives every event (fan-out) and rebuilds its boards
+by replay on startup. An instance does not accept connections until replay has
+reached the log's end offsets as they were at startup. The topic has infinite
+retention. Records are validated again when consumed, so a malformed record is
+skipped and cannot crash the hub or consume a `seq`.
+
+**Alternatives:** Instance-assigned `seq` (breaks with multiple instances); a
+shared consumer group (each event goes to only one instance, which is
+work-sharing, not fan-out); Redis pub/sub (fan-out only, no durable log).
+
+**Trade-off:** Anything a client has seen echoed is already in the log, so it
+survives a crash, and the log doubles as the replay source for undo. The costs
+are an extra round trip on every shape action, startup time that grows with the
+log (step 3 adds snapshots that record the offset they cover so only the tail
+is replayed), unbounded topic growth, and a failed publish that simply drops
+the action (it is logged, and the client never sees an echo). Freehand strokes
+still use a local relay, so they do not reach other instances yet.
 
 ---
 

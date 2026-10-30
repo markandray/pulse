@@ -19,20 +19,36 @@ type Store interface {
     Save(ctx context.Context, b *Board) error
 }
 
-type Hub struct {
-    rooms       map[string]map[*Client]struct{}
-    boards      map[string]*Board
-    join        chan *Client
-    leave       chan *Client
-    broadcast   chan Message
-    quit        chan chan struct{}
-    done        chan struct{}
-    persistDone chan struct{}
+// EventLog is the durable, ordered log of shape events (Kafka in production).
+type EventLog interface {
+    Publish(room string, data []byte)
+}
 
-    store    Store
-    interval time.Duration
-    persist  chan *Board
-    dirty    map[string]struct{}
+// record is one event read back from the log.
+type record struct {
+    room      string
+    data      []byte
+    partition int32 // unused until step 3, when snapshots store them
+    offset    int64
+}
+
+type Hub struct {
+    rooms     map[string]map[*Client]struct{}
+    boards    map[string]*Board
+    join      chan *Client
+    leave     chan *Client
+    broadcast chan Message
+    records   chan record
+
+    events EventLog // nil means "no log": events are applied directly
+
+    store       Store
+    interval    time.Duration
+    persist     chan *Board
+    dirty       map[string]struct{}
+    quit        chan chan struct{}
+    done        chan struct{} // closed when Run has exited
+    persistDone chan struct{}
 }
 
 func New() *Hub {
@@ -42,27 +58,22 @@ func New() *Hub {
         join:      make(chan *Client),
         leave:     make(chan *Client),
         broadcast: make(chan Message, 256),
+        records:   make(chan record), // unbuffered: Deliver returns once the hub has taken the record
         quit:      make(chan chan struct{}),
         done:      make(chan struct{}),
     }
 }
 
-func (h *Hub) board(room string) *Board {
-    b, ok := h.boards[room]
-    if !ok {
-        b = NewBoard(room)
-        h.boards[room] = b
-    }
-    return b
-}
+// SetEventLog switches the hub to log mode. Call before Run.
+func (h *Hub) SetEventLog(l EventLog) { h.events = l }
 
-// Call before Run.
+// EnablePersistence turns on Mongo snapshots (non-log mode). Call before Run.
 func (h *Hub) EnablePersistence(s Store, every time.Duration) {
     h.store = s
     h.interval = every
     h.persist = make(chan *Board, 64)
-    h.dirty = map[string]struct{}{}
     h.persistDone = make(chan struct{})
+    h.dirty = map[string]struct{}{}
     go h.persister()
 }
 
@@ -96,6 +107,7 @@ func (h *Hub) flush() {
     }
 }
 
+// flushAll blocks until every dirty board is handed to the persister.
 func (h *Hub) flushAll() {
     for room := range h.dirty {
         h.persist <- h.snapshotOf(room)
@@ -103,23 +115,13 @@ func (h *Hub) flushAll() {
     }
 }
 
-func (h *Hub) Shutdown(ctx context.Context) error {
-    ack := make(chan struct{})
-    select {
-    case <-h.done:
-        return nil
-    case h.quit <- ack:
-    case <-ctx.Done():
-        return ctx.Err()
+func (h *Hub) board(room string) *Board {
+    b, ok := h.boards[room]
+    if !ok {
+        b = NewBoard(room)
+        h.boards[room] = b
     }
-    select {
-    case <-ack:
-        return nil
-    case <-h.done:
-        return nil
-    case <-ctx.Done():
-        return ctx.Err()
-    }
+    return b
 }
 
 func (h *Hub) remove(c *Client) {
@@ -134,6 +136,91 @@ func (h *Hub) remove(c *Client) {
     }
 }
 
+// sendTo queues data for a client, dropping the client if it is too slow.
+func (h *Hub) sendTo(c *Client, data []byte) {
+    select {
+    case c.send <- data:
+    default:
+        h.remove(c)
+    }
+}
+
+// applyEvent assigns the room's next seq, applies the event to the board and
+// sends it to every client in the room, sender included.
+func (h *Hub) applyEvent(room string, ev *Event) {
+    b := h.board(room)
+    b.Seq++
+    ev.Seq = b.Seq
+    b.Apply(ev)
+    if h.dirty != nil {
+        h.dirty[room] = struct{}{}
+    }
+    clients := h.rooms[room]
+    if len(clients) == 0 {
+        return // nobody to tell (e.g. during replay): skip the marshal
+    }
+    data, err := json.Marshal(ev)
+    if err != nil {
+        return
+    }
+    for c := range clients {
+        h.sendTo(c, data)
+    }
+}
+
+// relay forwards raw bytes to everyone in the room except the sender.
+func (h *Hub) relay(m Message) {
+    for c := range h.rooms[m.Room] {
+        if c != m.From {
+            h.sendTo(c, m.Data)
+        }
+    }
+}
+
+// submit sends a validated shape event on its way: to the log if there is one,
+// otherwise straight to the hub.
+func (h *Hub) submit(room string, ev *Event, from *Client) {
+    if h.events != nil {
+        ev.Seq = 0 // never trust a client-supplied seq; it is assigned on consume
+        data, err := json.Marshal(ev)
+        if err != nil {
+            return
+        }
+        h.events.Publish(room, data)
+        return
+    }
+    select {
+    case h.broadcast <- Message{Room: room, From: from, Event: ev}:
+    case <-h.done:
+    }
+}
+
+// Deliver hands the hub one record read from the log. It blocks until the hub
+// has taken it, so records are applied in the order they were delivered.
+func (h *Hub) Deliver(room string, data []byte, partition int32, offset int64) {
+    select {
+    case h.records <- record{room: room, data: data, partition: partition, offset: offset}:
+    case <-h.done:
+    }
+}
+
+func (h *Hub) Shutdown(ctx context.Context) error {
+    ack := make(chan struct{})
+    select {
+    case h.quit <- ack:
+    case <-h.done: // already shut down
+        return nil
+    case <-ctx.Done():
+        return ctx.Err()
+    }
+    select {
+    case <-ack:
+        return nil
+    case <-ctx.Done():
+        return ctx.Err()
+    }
+}
+
 func (h *Hub) Run() {
     var tick <-chan time.Time
     if h.store != nil {
@@ -141,6 +228,7 @@ func (h *Hub) Run() {
         defer t.Stop()
         tick = t.C
     }
+
     for {
         select {
         case c := <-h.join:
@@ -153,46 +241,35 @@ func (h *Hub) Run() {
             }
             h.rooms[c.room][c] = struct{}{}
             // snapshot first, before any live event can reach this client
-            select {
-            case c.send <- h.board(c.room).Snapshot():
-            default:
-                h.remove(c)
-            }
+            h.sendTo(c, h.board(c.room).Snapshot())
+
         case c := <-h.leave:
             h.remove(c)
+
         case m := <-h.broadcast:
-            data := m.Data
-            toSender := false
             if m.Event != nil {
-                b := h.board(m.Room)
-                b.Seq++
-                m.Event.Seq = b.Seq
-                b.Apply(m.Event)
-                if h.dirty != nil {
-                    h.dirty[m.Room] = struct{}{}
-                }
-                var err error
-                if data, err = json.Marshal(m.Event); err != nil {
-                    continue
-                }
-                toSender = true // everyone, sender included, sees the one agreed order
+                h.applyEvent(m.Room, m.Event)
+            } else {
+                h.relay(m)
             }
-            for c := range h.rooms[m.Room] {
-                if c == m.From && !toSender {
-                    continue
-                }
-                select {
-                case c.send <- data:
-                default:
-                    h.remove(c)
-                }
+
+        case rec := <-h.records:
+            var ev Event
+            if err := json.Unmarshal(rec.data, &ev); err != nil || !ev.Valid() {
+                // A poison pill in a permanent log must never crash the hub.
+                log.Printf("skipping bad log record (room %q, partition %d, offset %d)",
+                    rec.room, rec.partition, rec.offset)
+                continue
             }
+            h.applyEvent(rec.room, &ev)
+
         case <-tick:
             h.flush()
+
         case ack := <-h.quit:
             for _, clients := range h.rooms {
                 for c := range clients {
-                    h.remove(c)
+                    h.remove(c) // closes send, so writePump sends a close frame
                 }
             }
             if h.persist != nil {

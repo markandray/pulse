@@ -48,27 +48,21 @@ func (c *Client) readPump() {
         if err := json.Unmarshal(data, &ev); err != nil {
             continue
         }
-        msg := Message{Room: c.room, Data: data, From: c}
         switch ev.Type {
-        case "add":
-            if ev.Shape == nil || ev.Shape.ID == "" {
+        case "add", "move", "delete":
+            if !ev.Valid() {
                 continue
             }
-            msg.Event = &ev
-        case "move", "delete":
-            if ev.ID == "" {
-                continue
-            }
-            msg.Event = &ev
+            c.hub.submit(c.room, &ev, c)
         case "seg":
-            // ephemeral: relayed as raw bytes
+            // ephemeral: relayed as raw bytes, never logged or persisted
+            select {
+            case c.hub.broadcast <- Message{Room: c.room, Data: data, From: c}:
+            case <-c.hub.done:
+                return
+            }
         default:
-            continue
-        }
-        select {
-        case c.hub.broadcast <- msg:
-        case <-c.hub.done:
-            return
+            // unknown type: ignore
         }
     }
 }

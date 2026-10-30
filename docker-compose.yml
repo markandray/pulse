@@ -43,8 +43,11 @@ services:
     environment:
       MONGO_URI: mongodb://mongo:27017
       PERSIST_INTERVAL: ${PERSIST_INTERVAL:-1s}
+      KAFKA_BROKERS: kafka:9092
     depends_on:
       mongo:
+        condition: service_healthy
+      kafka:
         condition: service_healthy
     restart: unless-stopped
 

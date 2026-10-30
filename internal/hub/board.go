@@ -57,3 +57,13 @@ func (b *Board) Snapshot() []byte {
     }{"snapshot", b.Seq, shapes})
     return data
 }
+
+func (e *Event) Valid() bool {
+    switch e.Type {
+    case "add":
+        return e.Shape != nil && e.Shape.ID != ""
+    case "move", "delete":
+        return e.ID != ""
+    }
+    return false
+}

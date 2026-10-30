@@ -227,3 +227,112 @@ func TestShutdownFlushesDirtyBoards(t *testing.T) {
         t.Fatal("dirty board was not persisted during shutdown")
     }
 }
+
+type published struct {
+    room string
+    data []byte
+}
+
+type fakeLog struct{ published chan published }
+
+func (f *fakeLog) Publish(room string, data []byte) {
+    f.published <- published{room, data}
+}
+
+func mustJSON(t *testing.T, v any) []byte {
+    t.Helper()
+    b, err := json.Marshal(v)
+    if err != nil {
+        t.Fatal(err)
+    }
+    return b
+}
+
+type snapshotMsg struct {
+    Type   string  `json:"type"`
+    Seq    uint64  `json:"seq"`
+    Shapes []Shape `json:"shapes"`
+}
+
+func joinAndSnapshot(t *testing.T, h *Hub, room string) snapshotMsg {
+    t.Helper()
+    c := newTestClient(h, room, 8)
+    h.join <- c
+    var s snapshotMsg
+    if err := json.Unmarshal(recv(t, c), &s); err != nil {
+        t.Fatal(err)
+    }
+    return s
+}
+
+func TestSubmitPublishesAndAppliesOnlyWhenDelivered(t *testing.T) {
+    h := New()
+    fl := &fakeLog{published: make(chan published, 4)}
+    h.SetEventLog(fl)
+    go h.Run()
+
+    a := newTestClient(h, "r1", 8)
+    h.join <- a
+    recv(t, a) // snapshot
+
+    h.submit("r1", &Event{Type: "add", Seq: 99, Shape: &Shape{ID: "s1", Kind: "rect"}}, a)
+
+    var p published
+    select {
+    case p = <-fl.published:
+    case <-time.After(time.Second):
+        t.Fatal("event was not published to the log")
+    }
+
+    var sent Event
+    if err := json.Unmarshal(p.data, &sent); err != nil {
+        t.Fatal(err)
+    }
+    if sent.Seq != 0 {
+        t.Fatalf("published seq = %d; a client must not choose its own seq", sent.Seq)
+    }
+
+    // Nothing was applied yet, so a new client sees an empty board.
+    if s := joinAndSnapshot(t, h, "r1"); s.Seq != 0 || len(s.Shapes) != 0 {
+        t.Fatalf("event applied before it came back from the log: %+v", s)
+    }
+
+    h.Deliver(p.room, p.data, 0, 0)
+    var ev Event
+    if err := json.Unmarshal(recv(t, a), &ev); err != nil {
+        t.Fatal(err)
+    }
+    if ev.Type != "add" || ev.Seq != 1 {
+        t.Fatalf("got %+v, want add at seq 1", ev)
+    }
+}
+
+func TestReplayRebuildsBoardBeforeAnyClientJoins(t *testing.T) {
+    h := New()
+    go h.Run()
+
+    h.Deliver("r1", mustJSON(t, Event{Type: "add", Shape: &Shape{ID: "s1", Kind: "rect"}}), 0, 0)
+    h.Deliver("r1", mustJSON(t, Event{Type: "add", Shape: &Shape{ID: "s2", Kind: "rect"}}), 0, 1)
+    h.Deliver("r1", mustJSON(t, Event{Type: "move", ID: "s1", X: 7, Y: 8}), 0, 2)
+    h.Deliver("r1", mustJSON(t, Event{Type: "delete", ID: "s2"}), 0, 3)
+
+    s := joinAndSnapshot(t, h, "r1")
+    if s.Seq != 4 || len(s.Shapes) != 1 || s.Shapes[0].ID != "s1" ||
+        s.Shapes[0].X != 7 || s.Shapes[0].Y != 8 {
+        t.Fatalf("replayed board = %+v", s)
+    }
+}
+
+func TestBadLogRecordsAreSkippedWithoutConsumingSeq(t *testing.T) {
+    h := New()
+    go h.Run()
+
+    h.Deliver("r1", []byte("garbage"), 0, 0)
+    h.Deliver("r1", mustJSON(t, Event{Type: "add"}), 0, 1) // add with no shape
+    h.Deliver("r1", mustJSON(t, Event{Type: "add", Shape: &Shape{ID: "s1", Kind: "rect"}}), 0, 2)
+
+    s := joinAndSnapshot(t, h, "r1")
+    if s.Seq != 1 || len(s.Shapes) != 1 {
+        t.Fatalf("board = %+v; poison records should be skipped and seq stay dense", s)
+    }
+}
