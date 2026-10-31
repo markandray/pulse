@@ -1,0 +1,73 @@
+{{- if .Values.nginx.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-nginx
+data:
+  nginx.conf: |
+    pid /tmp/nginx.pid;
+    worker_processes auto;
+    error_log /dev/stderr warn;
+
+    events {
+      worker_connections {{ .Values.nginx.workerConnections }};
+    }
+
+    http {
+      access_log /dev/stdout;
+
+      # the unprivileged image can only write under /tmp
+      client_body_temp_path /tmp/client_temp;
+      proxy_temp_path       /tmp/proxy_temp;
+      fastcgi_temp_path     /tmp/fastcgi_temp;
+      uwsgi_temp_path       /tmp/uwsgi_temp;
+      scgi_temp_path        /tmp/scgi_temp;
+
+      # "Connection: upgrade" for WebSocket handshakes, "close" for plain requests
+      map $http_upgrade $connection_upgrade {
+        default upgrade;
+        ''      close;
+      }
+
+      # The Pulse Service has one stable virtual IP; kube-proxy chooses a ready
+      # pod for every new TCP connection.
+      upstream pulse {
+        server {{ .Release.Name }}:80;
+      }
+
+      server {
+        listen 8080;
+
+        location = /nginx-health {
+          access_log off;
+          return 200 "ok\n";
+        }
+
+        location /ws {
+          proxy_pass http://pulse;
+          proxy_http_version 1.1;
+          proxy_set_header Upgrade $http_upgrade;
+          proxy_set_header Connection $connection_upgrade;
+          proxy_set_header Host $host;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+          proxy_read_timeout {{ .Values.nginx.readTimeout }};
+          proxy_send_timeout {{ .Values.nginx.readTimeout }};
+          proxy_buffering off;
+
+          # a pod that is starting or draining answers 503: try again, and the
+          # next connection to the Service may reach a different pod
+          proxy_next_upstream error timeout http_503;
+          proxy_next_upstream_tries 3;
+        }
+
+        location / {
+          proxy_pass http://pulse;
+          proxy_http_version 1.1;
+          proxy_set_header Host $host;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_next_upstream error timeout http_503;
+        }
+      }
+    }
+{{- end }}

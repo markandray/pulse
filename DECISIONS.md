@@ -482,6 +482,46 @@ which is acceptable for a local cluster but would be the first thing to change
 in production. Every replica writes snapshots, which monotonic writes
 (decision 22) make safe.
 
+## 26. NGINX as a plain reverse proxy, not an ingress controller
+
+**Context:** The plan called for an NGINX ingress. The community ingress-nginx
+controller was retired in March 2026: the repository is archived and no
+security fixes are published.
+
+**Decision:** NGINX runs as a normal Deployment (two replicas, non-root image)
+with its configuration in a ConfigMap, exposed through a NodePort mapped to
+localhost by kind. The configuration forwards the WebSocket upgrade headers
+over HTTP/1.1, sets explicit long idle timeouts, and retries a 503 from a pod
+that is starting or draining.
+
+**Alternatives:** The retired controller; a Gateway API implementation or
+another ingress controller.
+
+**Trade-off:** There is no Ingress resource, TLS termination, or hostname
+routing, which matters on a real cluster, where a Gateway API implementation
+would be the migration path. In exchange, the proxy configuration is fully
+visible and is the part that actually has to be understood for WebSockets.
+
+## 27. No session affinity; any pod can serve any room
+
+**Context:** Stickiness is usually needed when pods hold private state.
+
+**Decision:** NGINX forwards to the Service's virtual IP and kube-proxy picks a
+ready pod per new connection, so there is no affinity. A WebSocket stays on its
+pod for its lifetime because it is one TCP connection. When that pod goes away,
+a client reconnects to whichever pod it reaches and receives a snapshot. Every
+pod derives its state from the same log, so which pod it is does not matter.
+
+**Alternatives:** Cookie or IP-hash affinity; consistent routing of a room to a
+pod.
+
+**Trade-off:** Pods consume every partition, so each carries every room's board
+in memory regardless of where its clients are, and memory grows with total
+data rather than with local load. Routing rooms to specific pods would shrink
+that, at the cost of the simplicity that makes a pod kill a non-event.
+Connections are balanced per connection, not per load, so a pod can end up
+with more clients than another.
+
 ---
 
 ## Known gaps and future work

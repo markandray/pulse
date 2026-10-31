@@ -19,3 +19,11 @@ resources:
     memory: 64Mi
   limits:
     memory: 256Mi
+
+nginx:
+  enabled: true
+  replicaCount: 2
+  image: nginxinc/nginx-unprivileged:1.28-alpine
+  nodePort: 30080
+  workerConnections: 4096
+  readTimeout: 3600s
