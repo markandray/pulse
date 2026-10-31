@@ -1,5 +1,6 @@
 .git
 .vscode
 .DS_Store
+deploy/
 DECISIONS.md
 docker-compose.yml

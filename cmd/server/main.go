@@ -8,6 +8,7 @@ import (
     "os"
     "os/signal"
     "strings"
+    "sync/atomic"
     "syscall"
     "time"
 
@@ -23,9 +24,55 @@ func env(key, def string) string {
     return def
 }
 
+func mustDuration(key, def string) time.Duration {
+    d, err := time.ParseDuration(env(key, def))
+    if err != nil {
+        log.Fatalf("%s: %v", key, err)
+    }
+    return d
+}
+
+// gate answers 503 until the instance is ready to serve traffic.
+func gate(ready *atomic.Bool, next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        if !ready.Load() {
+            http.Error(w, "starting up or shutting down", http.StatusServiceUnavailable)
+            return
+        }
+        next.ServeHTTP(w, r)
+    })
+}
+
 func main() {
     ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
     defer stop()
+
+    h := hub.New()
+    var ready atomic.Bool
+
+    // The server starts first so /healthz answers during replay. Everything
+    // that serves users stays behind the ready gate.
+    mux := http.NewServeMux()
+    mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+        w.Write([]byte("ok"))
+    })
+    mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+        if !ready.Load() {
+            http.Error(w, "not ready", http.StatusServiceUnavailable)
+            return
+        }
+        w.Write([]byte("ok"))
+    })
+    mux.Handle("/ws", gate(&ready, http.HandlerFunc(h.ServeWS)))
+    mux.Handle("/", gate(&ready, http.FileServer(http.Dir(env("WEB_DIR", "web")))))
+
+    srv := &http.Server{Addr: env("ADDR", ":8080"), Handler: mux}
+    go func() {
+        if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+            log.Fatal(err)
+        }
+    }()
+    log.Println("listening on", srv.Addr, "(not ready until startup completes)")
 
     st, err := store.New(ctx, env("MONGO_URI", "mongodb://localhost:27017"))
     if err != nil {
@@ -34,12 +81,8 @@ func main() {
     defer st.Close(context.Background())
     log.Println("connected to mongo")
 
-    interval, err := time.ParseDuration(env("PERSIST_INTERVAL", "1s"))
-    if err != nil {
-        log.Fatal("PERSIST_INTERVAL: ", err)
-    }
+    interval := mustDuration("PERSIST_INTERVAL", "1s")
 
-    h := hub.New()
     var lg *eventlog.Log
     var offsets map[int32]int64
 
@@ -50,8 +93,8 @@ func main() {
             log.Fatal("kafka: ", err)
         }
         defer lg.Close()
-        h.SetEventLog(lg)
         log.Println("instance", lg.Instance())
+        h.SetEventLog(lg)
 
         var boards []*hub.Board
         boards, offsets, err = st.LoadCheckpoint(ctx)
@@ -84,20 +127,16 @@ func main() {
         }
     }
 
-    mux := http.NewServeMux()
-    mux.HandleFunc("/ws", h.ServeWS)
-    mux.Handle("/", http.FileServer(http.Dir(env("WEB_DIR", "web"))))
-
-    srv := &http.Server{Addr: env("ADDR", ":8080"), Handler: mux}
-    go func() {
-        if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-            log.Fatal(err)
-        }
-    }()
-    log.Println("listening on", srv.Addr)
+    ready.Store(true)
+    log.Println("ready")
 
     <-ctx.Done()
     log.Println("shutting down")
+
+    // Stop advertising readiness, then give the proxies a moment to notice
+    // before we start closing connections.
+    ready.Store(false)
+    time.Sleep(mustDuration("SHUTDOWN_DELAY", "0s"))
 
     shutCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
     defer cancel()

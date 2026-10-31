@@ -447,6 +447,41 @@ checks.
 **Trade-off:** The tests are fast and deterministic, but the real Kafka
 producer, consumer and offset handling are not covered automatically.
 
+## 24. Liveness and readiness are separate, and shutdown drains first
+
+**Context:** Replay takes time that grows with the log, and Kubernetes removes
+a terminating pod from its Service at about the same moment it signals the
+pod, so new connections can still arrive for a few seconds.
+
+**Decision:** The HTTP server starts immediately. `/healthz` is a liveness
+check that answers as soon as the process runs; `/readyz`, `/ws` and the web
+page return 503 until replay is complete. On SIGTERM the instance flips to
+not-ready, waits `SHUTDOWN_DELAY` (5 s in the chart) for proxies to notice,
+then runs the normal shutdown (stop listener, flush the log, close clients
+with a close frame so they reconnect to another pod). The pod's termination
+grace period (30 s) covers the delay plus the shutdown budget.
+
+**Alternatives:** A startup probe with a long failure threshold around a
+single probe endpoint; a `preStop` sleep in the pod spec instead of in the app.
+
+**Trade-off:** Liveness only proves the process answers HTTP, so a deadlocked
+hub would not be detected (a probe that round-trips through the hub would
+fix that). The drain delay lengthens every deploy slightly.
+
+## 25. Helm for the service, plain manifests for the infrastructure
+
+**Decision:** Mongo and Kafka run as single-replica StatefulSets from plain
+manifests, since they are dependencies and not the thing being built. The Pulse
+service is a Helm chart with three replicas, a rolling update that never drops
+below full ready capacity (`maxUnavailable: 0`), replicas spread across nodes
+where possible, and a PodDisruptionBudget of two. Configuration is passed
+through environment variables in `values.yaml`.
+
+**Trade-off:** Single-replica Kafka and Mongo are single points of failure,
+which is acceptable for a local cluster but would be the first thing to change
+in production. Every replica writes snapshots, which monotonic writes
+(decision 22) make safe.
+
 ---
 
 ## Known gaps and future work

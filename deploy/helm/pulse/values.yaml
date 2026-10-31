@@ -1,0 +1,21 @@
+replicaCount: 3
+
+image:
+  repository: pulse
+  tag: dev
+  pullPolicy: IfNotPresent   # the image is loaded into kind, never pulled
+
+terminationGracePeriodSeconds: 30   # must exceed SHUTDOWN_DELAY + the 8s shutdown budget
+
+env:
+  MONGO_URI: mongodb://mongo:27017
+  KAFKA_BROKERS: kafka:9092
+  PERSIST_INTERVAL: 1s
+  SHUTDOWN_DELAY: 5s
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 256Mi

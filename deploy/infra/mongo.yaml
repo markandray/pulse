@@ -35,6 +35,7 @@ spec:
               command: ["mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
             initialDelaySeconds: 5
             periodSeconds: 5
+            timeoutSeconds: 5
           volumeMounts:
             - name: data
               mountPath: /data/db
