@@ -1,0 +1,106 @@
+{
+  "uid": "pulse",
+  "title": "Pulse",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1, "type": "timeseries", "title": "Active WebSocket connections (per pod)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "sum by (pod) (pulse_ws_connections_active)", "legendFormat": "{{pod}}" }
+      ]
+    },
+    {
+      "id": 2, "type": "timeseries", "title": "Shape events applied per second (system-wide)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "max by (type) (rate(pulse_events_applied_total[30s]))", "legendFormat": "{{type}}" }
+      ]
+    },
+    {
+      "id": 3, "type": "timeseries", "title": "Messages received from clients per second",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "sum by (type) (rate(pulse_messages_received_total[30s]))", "legendFormat": "{{type}}" }
+      ]
+    },
+    {
+      "id": 4, "type": "timeseries", "title": "Messages sent to clients per second (per pod)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "sum by (pod) (rate(pulse_messages_sent_total[30s]))", "legendFormat": "{{pod}}" }
+      ]
+    },
+    {
+      "id": 5, "type": "timeseries", "title": "Publish to apply latency (publish, Kafka, consume, apply)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 16, "w": 12, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.50, sum by (le) (rate(pulse_publish_to_apply_seconds_bucket[1m])))", "legendFormat": "p50" },
+        { "refId": "B", "expr": "histogram_quantile(0.95, sum by (le) (rate(pulse_publish_to_apply_seconds_bucket[1m])))", "legendFormat": "p95" },
+        { "refId": "C", "expr": "histogram_quantile(0.99, sum by (le) (rate(pulse_publish_to_apply_seconds_bucket[1m])))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "id": 6, "type": "timeseries", "title": "Hub broadcast time per event (fan-out to local clients)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 12, "y": 16, "w": 12, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.50, sum by (le) (rate(pulse_broadcast_seconds_bucket[1m])))", "legendFormat": "p50" },
+        { "refId": "B", "expr": "histogram_quantile(0.99, sum by (le) (rate(pulse_broadcast_seconds_bucket[1m])))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "id": 7, "type": "timeseries", "title": "Trouble counters (per minute)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 24, "w": 12, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "sum(increase(pulse_slow_clients_dropped_total[1m]))", "legendFormat": "slow clients dropped" },
+        { "refId": "B", "expr": "sum(increase(pulse_bad_log_records_total[1m]))", "legendFormat": "bad log records" },
+        { "refId": "C", "expr": "sum(increase(pulse_snapshot_save_errors_total[1m]))", "legendFormat": "snapshot save errors" },
+        { "refId": "D", "expr": "sum(increase(pulse_kafka_publish_errors_total[1m]))", "legendFormat": "kafka publish errors" }
+      ]
+    },
+    {
+      "id": 8, "type": "timeseries", "title": "Goroutines (per pod)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 12, "y": 24, "w": 12, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "sum by (pod) (go_goroutines)", "legendFormat": "{{pod}}" }
+      ]
+    },
+    {
+      "id": 9, "type": "timeseries", "title": "Resident memory (per pod)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 32, "w": 12, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "bytes" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "sum by (pod) (process_resident_memory_bytes)", "legendFormat": "{{pod}}" }
+      ]
+    },
+    {
+      "id": 10, "type": "stat", "title": "Startup replay duration",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 12, "y": 32, "w": 12, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "max(pulse_replay_duration_seconds)" }
+      ]
+    }
+  ]
+}

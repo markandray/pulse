@@ -6,6 +6,8 @@ import (
     "errors"
     "testing"
     "time"
+
+    "github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func newTestClient(h *Hub, room string, buf int) *Client {
@@ -470,5 +472,40 @@ func TestStaleUndoIsHarmless(t *testing.T) {
     }
     if s.Seq != 3 {
         t.Fatalf("seq = %d, want 3 (a valid event always consumes a seq, even if it is a no-op)", s.Seq)
+    }
+}
+
+func TestMetricsTrackConnectionsAndEvents(t *testing.T) {
+    conns0 := testutil.ToFloat64(mConnections)
+    adds0 := testutil.ToFloat64(mEventsApplied.WithLabelValues("add"))
+    bad0 := testutil.ToFloat64(mBadRecords)
+
+    h := New()
+    go h.Run()
+
+    a := newTestClient(h, "r1", 8)
+    h.join <- a
+    recv(t, a) // snapshot
+    h.Deliver("r1", addJSON(t, "s1"), 0, 0)
+    recv(t, a) // the event, so it has been applied
+    h.Deliver("r1", []byte("garbage"), 0, 1)
+
+    if got := testutil.ToFloat64(mConnections) - conns0; got != 1 {
+        t.Fatalf("connections +%v, want +1", got)
+    }
+    if got := testutil.ToFloat64(mEventsApplied.WithLabelValues("add")) - adds0; got != 1 {
+        t.Fatalf("applied adds +%v, want +1", got)
+    }
+
+    h.leave <- a
+    // joining another client is a barrier: the hub has processed the leave before it
+    b := newTestClient(h, "r2", 8)
+    h.join <- b
+    recv(t, b)
+    if got := testutil.ToFloat64(mConnections) - conns0; got != 1 {
+        t.Fatalf("after leave and join, connections +%v, want +1 (only b)", got)
+    }
+    if got := testutil.ToFloat64(mBadRecords) - bad0; got != 1 {
+        t.Fatalf("bad records +%v, want +1", got)
     }
 }

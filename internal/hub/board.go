@@ -15,6 +15,7 @@ type Shape struct {
 type Event struct {
     Type  string  `json:"type"`
     Seq   uint64  `json:"seq,omitempty"`
+    Pub   int64   `json:"pub,omitempty"` // publish time (unix ns), internal only
     Shape *Shape  `json:"shape,omitempty"`
     ID    string  `json:"id,omitempty"`
     X     float64 `json:"x"`

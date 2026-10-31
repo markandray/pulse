@@ -47,18 +47,21 @@ func (c *Client) readPump() {
 		}
 		var ev Event
 		if err := json.Unmarshal(data, &ev); err != nil {
+			mMessagesIn.WithLabelValues("invalid").Inc()
 			continue
 		}
 		switch ev.Type {
 		case "add", "move", "delete":
 			if !ev.Valid() {
+				mMessagesIn.WithLabelValues("invalid").Inc()
 				continue
 			}
+			mMessagesIn.WithLabelValues(ev.Type).Inc()
 			c.hub.submit(c.room, &ev, c)
 		case "seg":
+			mMessagesIn.WithLabelValues("seg").Inc()
 			// Ephemeral: relayed to this instance's other clients immediately,
 			// and to the other instances through the short-lived topic.
-			// Never logged, replayed or persisted.
 			select {
 			case c.hub.broadcast <- Message{Room: c.room, Data: data, From: c}:
 			case <-c.hub.done:
@@ -68,7 +71,7 @@ func (c *Client) readPump() {
 				c.hub.events.PublishEphemeral(c.room, data)
 			}
 		default:
-			// unknown type: ignore
+			mMessagesIn.WithLabelValues("unknown").Inc() // never use client text as a label
 		}
 	}
 }

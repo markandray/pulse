@@ -8,10 +8,17 @@ import (
     "fmt"
     "log"
 
+    "github.com/prometheus/client_golang/prometheus"
+    "github.com/prometheus/client_golang/prometheus/promauto"
     "github.com/twmb/franz-go/pkg/kadm"
     "github.com/twmb/franz-go/pkg/kerr"
     "github.com/twmb/franz-go/pkg/kgo"
 )
+
+var mPublishErrors = promauto.NewCounterVec(prometheus.CounterOpts{
+    Name: "pulse_kafka_publish_errors_total",
+    Help: "Kafka publishes that failed, by kind (event or ephemeral).",
+}, []string{"kind"})
 
 // Log is the durable event log, backed by one Kafka topic keyed by room.
 //
@@ -69,6 +76,7 @@ func (l *Log) Publish(room string, data []byte) {
         func(_ *kgo.Record, err error) {
             if err != nil {
                 log.Printf("eventlog: publish failed: %v", err)
+                mPublishErrors.WithLabelValues("event").Inc()
             }
         })
 }
@@ -84,6 +92,7 @@ func (l *Log) PublishEphemeral(room string, data []byte) {
     }, func(_ *kgo.Record, err error) {
         if err != nil {
             log.Printf("eventlog: ephemeral publish failed: %v", err)
+            mPublishErrors.WithLabelValues("ephemeral").Inc()
         }
     })
 }

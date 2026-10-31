@@ -4,6 +4,7 @@ import (
     "context"
     "encoding/json"
     "log"
+    "sync/atomic"
     "time"
 )
 
@@ -59,6 +60,7 @@ type Hub struct {
     records   chan record
 
     events EventLog // nil means "no log": events are applied directly
+    live   atomic.Bool // true once startup replay is done, so latency samples are meaningful
 
     // log mode: last offset consumed per partition, and the offsets covered
     // by the last successful checkpoint
@@ -94,6 +96,9 @@ func New() *Hub {
 // SetEventLog switches the hub to log mode. Call before Run.
 func (h *Hub) SetEventLog(l EventLog) { h.events = l }
 
+// MarkLive tells the hub that replay is over, so latency is measured from now on.
+func (h *Hub) MarkLive() { h.live.Store(true) }
+
 // Restore loads boards and the checkpoint they were saved with. Call before Run.
 func (h *Hub) Restore(boards []*Board, offsets map[int32]int64) {
     for _, b := range boards {
@@ -119,6 +124,7 @@ func (h *Hub) EnablePersistence(s Store, every time.Duration) {
 func (h *Hub) persister() {
     defer close(h.persistDone)
     for b := range h.persist {
+        start := time.Now()
         ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
         var err error
         if b.offsets != nil {
@@ -131,6 +137,7 @@ func (h *Hub) persister() {
             }
         }
         cancel()
+        mSaveSeconds.Observe(time.Since(start).Seconds())
 
         rooms := make([]string, len(b.boards))
         for i, bd := range b.boards {
@@ -198,6 +205,7 @@ func (h *Hub) buildBatch() *batch {
 func (h *Hub) handleSaved(r saveResult) {
     h.flushing = false
     if r.err != nil {
+        mSaveErrors.Inc()
         log.Println("save failed, will retry:", r.err)
         for _, room := range r.rooms {
             h.dirty[room] = struct{}{}
@@ -222,6 +230,7 @@ func (h *Hub) remove(c *Client) {
     if clients, ok := h.rooms[c.room]; ok {
         if _, ok := clients[c]; ok {
             delete(clients, c)
+            mConnections.Dec()
             close(c.send)
             if len(clients) == 0 {
                 delete(h.rooms, c.room) // the board stays in h.boards
@@ -234,7 +243,9 @@ func (h *Hub) remove(c *Client) {
 func (h *Hub) sendTo(c *Client, data []byte) {
     select {
     case c.send <- data:
+        mMessagesOut.Inc()
     default:
+        mSlowDropped.Inc()
         h.remove(c)
     }
 }
@@ -246,6 +257,7 @@ func (h *Hub) applyEvent(room string, ev *Event) {
     b.Seq++
     ev.Seq = b.Seq
     b.Apply(ev)
+    mEventsApplied.WithLabelValues(ev.Type).Inc()
     if h.dirty != nil {
         h.dirty[room] = struct{}{}
     }
@@ -253,6 +265,7 @@ func (h *Hub) applyEvent(room string, ev *Event) {
     if len(clients) == 0 {
         return // nobody to tell (e.g. during replay): skip the marshal
     }
+    start := time.Now()
     data, err := json.Marshal(ev)
     if err != nil {
         return
@@ -260,6 +273,7 @@ func (h *Hub) applyEvent(room string, ev *Event) {
     for c := range clients {
         h.sendTo(c, data)
     }
+    mBroadcastSeconds.Observe(time.Since(start).Seconds())
 }
 
 // relay forwards raw bytes to everyone in the room except the sender.
@@ -276,6 +290,7 @@ func (h *Hub) relay(m Message) {
 func (h *Hub) submit(room string, ev *Event, from *Client) {
     if h.events != nil {
         ev.Seq = 0 // never trust a client-supplied seq; it is assigned on consume
+        ev.Pub = time.Now().UnixNano()
         data, err := json.Marshal(ev)
         if err != nil {
             return
@@ -343,6 +358,7 @@ func (h *Hub) Run() {
                 h.rooms[c.room] = map[*Client]struct{}{}
             }
             h.rooms[c.room][c] = struct{}{}
+            mConnections.Inc()
             // snapshot first, before any live event can reach this client
             h.sendTo(c, h.board(c.room).Snapshot())
 
@@ -357,14 +373,22 @@ func (h *Hub) Run() {
             }
 
         case rec := <-h.records:
+            mLogRecords.Inc()
             h.applied[rec.partition] = rec.offset // consumed, valid or not
 
             var ev Event
             if err := json.Unmarshal(rec.data, &ev); err != nil || !ev.Valid() {
                 // A poison pill in a permanent log must never crash the hub.
+                mBadRecords.Inc()
                 log.Printf("skipping bad log record (room %q, partition %d, offset %d)",
                     rec.room, rec.partition, rec.offset)
                 continue
+            }
+            if ev.Pub != 0 {
+                if h.live.Load() {
+                    mPublishToApply.Observe(time.Since(time.Unix(0, ev.Pub)).Seconds())
+                }
+                ev.Pub = 0 // internal; never sent to clients
             }
             b := h.board(rec.room)
             if b.Partition == rec.partition && rec.offset <= b.Offset {

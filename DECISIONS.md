@@ -522,6 +522,38 @@ that, at the cost of the simplicity that makes a pod kill a non-event.
 Connections are balanced per connection, not per load, so a pod can end up
 with more clients than another.
 
+## 28. A small, bounded metric set that answers specific questions
+
+**Decision:** Each instance exposes Prometheus metrics for connections,
+messages in and out, events applied, publish-to-apply latency, hub broadcast
+time, dropped slow clients, log and snapshot health, and startup replay time.
+Label values come from a fixed set; anything client-supplied that is not
+recognised is counted as `unknown` or `invalid`, so a client cannot create an
+unbounded number of series. Publish-to-apply latency is measured with a
+timestamp carried in the event itself and is recorded only after replay has
+finished, so replayed history cannot pollute it.
+
+**Alternatives:** OpenTelemetry metrics through a Prometheus exporter, which
+translates metric names; a larger metric set.
+
+**Trade-off:** The latency number depends on publisher and consumer clocks
+agreeing, which holds in a single-host cluster but not in general. Because every
+pod applies every event, event-rate panels use a max across pods, not a sum.
+
+## 29. Metrics on a private port; plain Prometheus and Grafana
+
+**Decision:** Metrics are served on port 9100, separate from the public port and
+never routed through NGINX. Prometheus finds pods through Kubernetes service
+discovery and scrapes them directly. Prometheus and Grafana run as plain
+single-replica Deployments with data in `emptyDir`, and Grafana is provisioned
+from ConfigMaps with anonymous access, for local use only.
+
+**Alternatives:** The kube-prometheus-stack chart with the Prometheus operator.
+
+**Trade-off:** Much lighter and easier to read, but there is no Alertmanager,
+no persistence (metrics vanish when Prometheus restarts), and no authentication,
+all of which a real deployment needs. NGINX is not instrumented.
+
 ---
 
 ## Known gaps and future work

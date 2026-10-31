@@ -15,6 +15,7 @@ import (
     "github.com/markandray/pulse/internal/eventlog"
     "github.com/markandray/pulse/internal/hub"
     "github.com/markandray/pulse/internal/store"
+    "github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func env(key, def string) string {
@@ -48,6 +49,15 @@ func main() {
     defer stop()
 
     h := hub.New()
+    // Metrics get their own port, which is not routed through NGINX, so they
+    // are not exposed to the internet.
+    go func() {
+        mm := http.NewServeMux()
+        mm.Handle("/metrics", promhttp.Handler())
+        if err := http.ListenAndServe(env("METRICS_ADDR", ":9100"), mm); err != nil {
+            log.Println("metrics server:", err)
+        }
+    }()
     var ready atomic.Bool
 
     // The server starts first so /healthz answers during replay. Everything
@@ -109,6 +119,7 @@ func main() {
     go h.Run()
 
     if lg != nil {
+        replayStart := time.Now()
         go func() {
             if err := lg.Consume(ctx, offsets, h.Deliver); err != nil {
                 log.Fatal("kafka consume: ", err)
@@ -121,6 +132,8 @@ func main() {
         }()
         select {
         case <-lg.Ready():
+            hub.RecordReplay(time.Since(replayStart))
+            h.MarkLive()
             log.Println("replay complete")
         case <-ctx.Done():
             return
