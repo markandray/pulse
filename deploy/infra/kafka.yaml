@@ -1,0 +1,68 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: pulse
+spec:
+  selector:
+    app: kafka
+  ports:
+    - name: client
+      port: 9092
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka
+  namespace: pulse
+spec:
+  serviceName: kafka
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kafka
+  template:
+    metadata:
+      labels:
+        app: kafka
+    spec:
+      # Without this, Kubernetes injects KAFKA_PORT, KAFKA_SERVICE_HOST, ... for the
+      # Service named "kafka", and the Kafka image turns every KAFKA_* variable
+      # into broker configuration.
+      enableServiceLinks: false
+      containers:
+        - name: kafka
+          image: apache/kafka:3.9.0
+          ports:
+            - containerPort: 9092
+            - containerPort: 9093
+          env:
+            - { name: KAFKA_NODE_ID, value: "1" }
+            - { name: KAFKA_PROCESS_ROLES, value: "broker,controller" }
+            - { name: KAFKA_LISTENERS, value: "INTERNAL://:9092,CONTROLLER://:9093" }
+            - { name: KAFKA_ADVERTISED_LISTENERS, value: "INTERNAL://kafka:9092" }
+            - { name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP, value: "INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT" }
+            - { name: KAFKA_INTER_BROKER_LISTENER_NAME, value: "INTERNAL" }
+            - { name: KAFKA_CONTROLLER_LISTENER_NAMES, value: "CONTROLLER" }
+            - { name: KAFKA_CONTROLLER_QUORUM_VOTERS, value: "1@localhost:9093" }
+            - { name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR, value: "1" }
+            - { name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR, value: "1" }
+            - { name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR, value: "1" }
+            - { name: KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS, value: "0" }
+            - { name: KAFKA_HEAP_OPTS, value: "-Xms512m -Xmx512m" }
+          readinessProbe:
+            tcpSocket:
+              port: 9092
+            initialDelaySeconds: 15
+            periodSeconds: 5
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/kafka/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

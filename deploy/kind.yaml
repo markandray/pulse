@@ -1,0 +1,11 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: pulse
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30080   # the NodePort our NGINX service will use
+        hostPort: 8080         # http://localhost:8080 on your laptop
+        protocol: TCP
+  - role: worker
+  - role: worker

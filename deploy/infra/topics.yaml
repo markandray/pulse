@@ -1,0 +1,25 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: create-topics
+  namespace: pulse
+spec:
+  backoffLimit: 20
+  template:
+    spec:
+      restartPolicy: OnFailure
+      enableServiceLinks: false
+      containers:
+        - name: topics
+          image: apache/kafka:3.9.0
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+              K=/opt/kafka/bin/kafka-topics.sh
+              $K --bootstrap-server kafka:9092 --create --if-not-exists \
+                --topic pulse-events --partitions 3 --replication-factor 1 \
+                --config retention.ms=-1
+              $K --bootstrap-server kafka:9092 --create --if-not-exists \
+                --topic pulse-events-ephemeral --partitions 3 --replication-factor 1 \
+                --config retention.ms=60000
