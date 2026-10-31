@@ -257,6 +257,8 @@ func (f *fakeLog) Publish(room string, data []byte) {
     f.published <- published{room, data}
 }
 
+func (f *fakeLog) PublishEphemeral(room string, data []byte) {}
+
 func mustJSON(t *testing.T, v any) []byte {
     t.Helper()
     b, err := json.Marshal(v)

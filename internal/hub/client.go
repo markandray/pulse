@@ -55,11 +55,16 @@ func (c *Client) readPump() {
             }
             c.hub.submit(c.room, &ev, c)
         case "seg":
-            // ephemeral: relayed as raw bytes, never logged or persisted
+            // Ephemeral: relayed to this instance's other clients immediately,
+            // and to the other instances through the short-lived topic.
+            // Never logged, replayed or persisted.
             select {
             case c.hub.broadcast <- Message{Room: c.room, Data: data, From: c}:
             case <-c.hub.done:
                 return
+            }
+            if c.hub.events != nil {
+                c.hub.events.PublishEphemeral(c.room, data)
             }
         default:
             // unknown type: ignore

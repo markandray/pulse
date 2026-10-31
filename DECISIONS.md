@@ -389,6 +389,64 @@ else (last-write-wins). Undone deletes return a shape to the top of the
 z-order. In exchange there is no new server state, so replay, snapshots and
 multi-instance fan-out are unaffected.
 
+## 21. Freehand strokes fan out over a short-retention topic
+
+**Context:** With two instances, a stroke from a client on one instance never
+reached clients on the other. Strokes are high-volume, disposable, and have no
+need for ordering or replay.
+
+**Decision:** An instance relays a stroke to its own clients immediately and also
+publishes it to a second topic with one-minute retention, tagged with the
+instance's id. Each instance consumes that topic from "now" with no replay and
+ignores records carrying its own id, so a stroke is delivered exactly once to
+each client. Strokes are never sequenced, persisted or replayed.
+
+**Alternatives:** Put strokes in the main log (permanent, replayed and
+checkpointed for no benefit); Redis pub/sub, the usual tool for pure fan-out,
+which would add another component.
+
+**Trade-off:** A stroke is lost if the receiving instance is down or
+disconnected, and it is not ordered relative to shape events. That is acceptable
+for ephemeral drawing, and strokes vanish on refresh, as before. Reusing Kafka
+avoids a fourth component, but Redis would be the more natural choice for this
+traffic.
+
+## 22. Snapshot writes are monotonic, so any instance may write
+
+**Context:** Every instance consumes the whole log, so every instance saves
+snapshots. Without care, a slower instance can overwrite a newer board and the
+checkpoint can then run ahead of that board, so a restart would silently skip
+events.
+
+**Decision:** A board document is replaced only if its stored offset is lower
+than the incoming one, and each partition's checkpoint advances with `$max`.
+Neither can move backward whichever instance writes, and a rejected write only
+means a newer snapshot already exists. All instances compute identical state
+from the same log, so any of their snapshots is valid.
+
+**Alternatives:** Leader election with a lease so one instance writes; one
+checkpoint document per instance.
+
+**Trade-off:** Every instance writes to MongoDB, so writes are duplicated by the
+number of instances, and leader-only snapshots would remove that. Correctness
+also depends on all instances running the same code, because an older version
+that applied events differently would produce incompatible snapshots.
+
+## 23. Multi-instance behaviour is tested on a simulated log
+
+**Context:** Kafka is slow and awkward to start in unit tests.
+
+**Decision:** An in-memory bus implements the same interface as the Kafka
+log: one total order, delivery to every attached instance, replay on attach, and
+an ephemeral channel that skips the sender. Two or three real hubs with real
+WebSocket servers run on it, and tests check shared ordering, the same seq on
+both instances, stroke delivery exactly once, and a fresh instance rebuilding
+from the full log. The Kafka client itself is covered by the manual Docker
+checks.
+
+**Trade-off:** The tests are fast and deterministic, but the real Kafka
+producer, consumer and offset handling are not covered automatically.
+
 ---
 
 ## Known gaps and future work

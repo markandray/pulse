@@ -25,6 +25,9 @@ type Store interface {
 // EventLog is the durable, ordered log of shape events (Kafka in production).
 type EventLog interface {
     Publish(room string, data []byte)
+    // PublishEphemeral sends a short-lived message (a freehand stroke) to the
+    // OTHER instances. It is never replayed.
+    PublishEphemeral(room string, data []byte)
 }
 
 // record is one event read back from the log.
@@ -291,6 +294,15 @@ func (h *Hub) submit(room string, ev *Event, from *Client) {
 func (h *Hub) Deliver(room string, data []byte, partition int32, offset int64) {
     select {
     case h.records <- record{room: room, data: data, partition: partition, offset: offset}:
+    case <-h.done:
+    }
+}
+
+// DeliverEphemeral hands the hub a stroke published by another instance. It has
+// no sender on this instance, so it goes to everyone in the room.
+func (h *Hub) DeliverEphemeral(room string, data []byte) {
+    select {
+    case h.broadcast <- Message{Room: room, Data: data}:
     case <-h.done:
     }
 }

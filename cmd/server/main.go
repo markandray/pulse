@@ -51,6 +51,7 @@ func main() {
         }
         defer lg.Close()
         h.SetEventLog(lg)
+        log.Println("instance", lg.Instance())
 
         var boards []*hub.Board
         boards, offsets, err = st.LoadCheckpoint(ctx)
@@ -68,6 +69,11 @@ func main() {
         go func() {
             if err := lg.Consume(ctx, offsets, h.Deliver); err != nil {
                 log.Fatal("kafka consume: ", err)
+            }
+        }()
+        go func() {
+            if err := lg.ConsumeEphemeral(ctx, h.DeliverEphemeral); err != nil {
+                log.Println("ephemeral consume:", err)
             }
         }()
         select {

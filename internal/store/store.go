@@ -20,6 +20,10 @@ type Store struct {
 }
 
 func New(ctx context.Context, uri string) (*Store, error) {
+    return NewDB(ctx, uri, "pulse")
+}
+
+func NewDB(ctx context.Context, uri, dbName string) (*Store, error) {
     client, err := mongo.Connect(options.Client().ApplyURI(uri))
     if err != nil {
         return nil, err
@@ -29,7 +33,7 @@ func New(ctx context.Context, uri string) (*Store, error) {
     if err := client.Ping(pingCtx, nil); err != nil {
         return nil, err
     }
-        db := client.Database("pulse")
+    db := client.Database(dbName)
     return &Store{
         client:     client,
         boards:     db.Collection("boards"),
@@ -70,22 +74,27 @@ type checkpointDoc struct {
     Offsets map[string]int64 `bson:"offsets"` // BSON keys must be strings
 }
 
-// SaveCheckpoint writes the boards first and the checkpoint last. The order is
-// the whole point: the checkpoint may only advance once every board it covers
-// is on disk.
+// SaveCheckpoint writes the boards first and the checkpoint last, and neither
+// ever moves backward. Several instances may call it concurrently; whoever is
+// furthest ahead wins, and a slower instance can never undo their work.
 func (s *Store) SaveCheckpoint(ctx context.Context, boards []*hub.Board, offsets map[int32]int64) error {
     for _, b := range boards {
-        if _, err := s.logBoards.ReplaceOne(ctx, bson.M{"_id": b.Room}, b,
-            options.Replace().SetUpsert(true)); err != nil {
+        _, err := s.logBoards.ReplaceOne(ctx,
+            bson.M{"_id": b.Room, "offset": bson.M{"$lt": b.Offset}},
+            b, options.Replace().SetUpsert(true))
+        if err != nil && !mongo.IsDuplicateKeyError(err) {
             return err
         }
     }
-    doc := checkpointDoc{ID: "offsets", Offsets: map[string]int64{}}
-    for p, o := range offsets {
-        doc.Offsets[strconv.Itoa(int(p))] = o
+    if len(offsets) == 0 {
+        return nil
     }
-    _, err := s.checkpoint.ReplaceOne(ctx, bson.M{"_id": "offsets"}, doc,
-        options.Replace().SetUpsert(true))
+    highest := bson.M{}
+    for p, o := range offsets {
+        highest["offsets."+strconv.Itoa(int(p))] = o
+    }
+    _, err := s.checkpoint.UpdateOne(ctx, bson.M{"_id": "offsets"},
+        bson.M{"$max": highest}, options.UpdateOne().SetUpsert(true))
     return err
 }
 

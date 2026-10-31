@@ -2,10 +2,14 @@ package eventlog
 
 import (
     "context"
+    "crypto/rand"
+    "encoding/hex"
+    "errors"
     "fmt"
     "log"
 
     "github.com/twmb/franz-go/pkg/kadm"
+    "github.com/twmb/franz-go/pkg/kerr"
     "github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -14,10 +18,12 @@ import (
 // Consumption uses no consumer group: every instance reads every partition,
 // starting from its own checkpoint, which is both fan-out and replay.
 type Log struct {
-    brokers []string
-    topic   string
-    cl      *kgo.Client // produces and administers; consuming uses its own client
-    ready   chan struct{}
+    brokers  []string
+    topic    string
+    ephTopic string // short-retention topic for freehand strokes
+    instance string // random id of this process
+    cl       *kgo.Client
+    ready    chan struct{}
 }
 
 func New(brokers []string, topic string) (*Log, error) {
@@ -25,8 +31,35 @@ func New(brokers []string, topic string) (*Log, error) {
     if err != nil {
         return nil, err
     }
-    return &Log{brokers: brokers, topic: topic, cl: cl, ready: make(chan struct{})}, nil
+
+    ephTopic := topic + "-ephemeral"
+    responses, err := kadm.NewClient(cl).CreateTopics(
+        context.Background(), -1, -1,
+        map[string]*string{"retention.ms": kadm.StringPtr("60000")},
+        ephTopic,
+    )
+    if err != nil {
+        cl.Close()
+        return nil, fmt.Errorf("create ephemeral topic %q: %w", ephTopic, err)
+    }
+    if err := responses.Error(); err != nil && !errors.Is(err, kerr.TopicAlreadyExists) {
+        cl.Close()
+        return nil, fmt.Errorf("create ephemeral topic %q: %w", ephTopic, err)
+    }
+
+    return &Log{
+        brokers: brokers, topic: topic, ephTopic: ephTopic,
+        instance: newInstanceID(), cl: cl, ready: make(chan struct{}),
+    }, nil
 }
+
+func newInstanceID() string {
+    b := make([]byte, 6)
+    rand.Read(b)
+    return hex.EncodeToString(b)
+}
+
+func (l *Log) Instance() string { return l.instance }
 
 // Publish queues an event for the room's partition and returns immediately.
 // Records from one goroutine for one key stay in order.
@@ -38,6 +71,21 @@ func (l *Log) Publish(room string, data []byte) {
                 log.Printf("eventlog: publish failed: %v", err)
             }
         })
+}
+
+// PublishEphemeral sends a stroke to the other instances. The record carries
+// this instance's id so the sender can skip its own.
+func (l *Log) PublishEphemeral(room string, data []byte) {
+    l.cl.Produce(context.Background(), &kgo.Record{
+        Topic:   l.ephTopic,
+        Key:     []byte(room),
+        Value:   data,
+        Headers: []kgo.RecordHeader{{Key: "src", Value: []byte(l.instance)}},
+    }, func(_ *kgo.Record, err error) {
+        if err != nil {
+            log.Printf("eventlog: ephemeral publish failed: %v", err)
+        }
+    })
 }
 
 // Ready is closed once everything that was in the log when Consume started
@@ -122,6 +170,38 @@ func (l *Log) Consume(ctx context.Context, start map[int32]int64,
                     close(l.ready)
                 }
             }
+        })
+    }
+}
+
+// ConsumeEphemeral delivers strokes from OTHER instances, starting from now.
+// Nothing is replayed: a stroke you were not connected for is gone, by design.
+func (l *Log) ConsumeEphemeral(ctx context.Context, deliver func(room string, data []byte)) error {
+    cons, err := kgo.NewClient(
+        kgo.SeedBrokers(l.brokers...),
+        kgo.ConsumeTopics(l.ephTopic),
+        kgo.ConsumeResetOffset(kgo.NewOffset().AtEnd()),
+    )
+    if err != nil {
+        return err
+    }
+    defer cons.Close()
+
+    for {
+        fetches := cons.PollFetches(ctx)
+        if ctx.Err() != nil || fetches.IsClientClosed() {
+            return nil
+        }
+        for _, fe := range fetches.Errors() {
+            log.Printf("eventlog: ephemeral fetch error: %v", fe.Err)
+        }
+        fetches.EachRecord(func(r *kgo.Record) {
+            for _, h := range r.Headers {
+                if h.Key == "src" && string(h.Value) == l.instance {
+                    return // our own stroke: we already relayed it locally
+                }
+            }
+            deliver(string(r.Key), r.Value)
         })
     }
 }
