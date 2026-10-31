@@ -88,7 +88,12 @@ project).
 
 **Trade-off:** Conflicts are still last-write-wins, but "last" now means last
 consumed from the log, which is the same order for every instance.
-Shape actions wait for a server round trip (invisible on localhost).
+Shape actions wait for a server round trip (invisible on localhost). Undo is a
+client-local stack of inverse events for the user's own shape actions. A
+multi-event move is one undo step; undoing a move restores its starting
+position and can therefore override a later remote move under the same
+last-write-wins rule. Undo skips entries for shapes another user has deleted,
+and undoing a delete re-adds the shape with its original ID.
 
 ## 6. Freehand strokes are ephemeral
 
@@ -359,6 +364,30 @@ change, because it would remap room keys to different partitions and break
 both ordering and the per-board offsets. Snapshots assume a single writer;
 with two instances an older snapshot can overwrite a newer one, which step 5
 must fix.
+
+## 20. Undo is a client-side compensating event
+
+**Context:** Users need to undo their own actions in a shared room. The event
+log is append-only and every instance must derive identical state from it.
+
+**Decision:** Each client keeps a history of the inverse of its own completed
+actions (the inverse of an add is a delete, of a move is a move back to where
+the drag started, of a delete is an add of the full shape under its original
+ID). One drag is one history entry. Undo sends the most recent inverse as an
+ordinary event; entries that someone else has already made pointless are
+skipped without sending anything. The server and the log are unchanged: an
+undo is indistinguishable from a normal edit and gets its own seq.
+
+**Alternatives:** Global undo of the room's last event (lets users erase each
+other's work); server-side per-user undo stacks (they affect how events are
+applied, so they would have to be stored in the snapshots and kept identical
+across instances, or boards diverge).
+
+**Trade-off:** History is lost on refresh, there is no redo, and undoing a move
+restores the position the user last saw, overriding any later move by someone
+else (last-write-wins). Undone deletes return a shape to the top of the
+z-order. In exchange there is no new server state, so replay, snapshots and
+multi-instance fan-out are unaffected.
 
 ---
 

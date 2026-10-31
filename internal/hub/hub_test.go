@@ -436,3 +436,37 @@ func TestFailedSaveIsRetried(t *testing.T) {
         t.Fatal("board was never saved after the first save failed")
     }
 }
+
+func TestUndoIsJustMoreEvents(t *testing.T) {
+    h := New()
+    go h.Run()
+
+    orig := Shape{ID: "s1", Kind: "rect", X: 10, Y: 20}
+    h.Deliver("r1", mustJSON(t, Event{Type: "add", Shape: &orig}), 0, 0)
+    h.Deliver("r1", mustJSON(t, Event{Type: "move", ID: "s1", X: 50, Y: 60}), 0, 1)
+    h.Deliver("r1", mustJSON(t, Event{Type: "move", ID: "s1", X: 10, Y: 20}), 0, 2) // undo the move
+    h.Deliver("r1", mustJSON(t, Event{Type: "delete", ID: "s1"}), 0, 3)
+    h.Deliver("r1", mustJSON(t, Event{Type: "add", Shape: &orig}), 0, 4) // undo the delete
+
+    s := joinAndSnapshot(t, h, "r1")
+    if s.Seq != 5 || len(s.Shapes) != 1 || s.Shapes[0].X != 10 || s.Shapes[0].Y != 20 {
+        t.Fatalf("board = %+v; want seq 5 and s1 back at (10,20)", s)
+    }
+}
+
+func TestStaleUndoIsHarmless(t *testing.T) {
+    h := New()
+    go h.Run()
+
+    h.Deliver("r1", addJSON(t, "s1"), 0, 0)
+    h.Deliver("r1", mustJSON(t, Event{Type: "delete", ID: "s1"}), 0, 1) // another user deletes it
+    h.Deliver("r1", mustJSON(t, Event{Type: "move", ID: "s1", X: 1, Y: 2}), 0, 2) // a late undo of my move
+
+    s := joinAndSnapshot(t, h, "r1")
+    if len(s.Shapes) != 0 {
+        t.Fatalf("a stale move resurrected or changed something: %+v", s.Shapes)
+    }
+    if s.Seq != 3 {
+        t.Fatalf("seq = %d, want 3 (a valid event always consumes a seq, even if it is a no-op)", s.Seq)
+    }
+}

@@ -16,6 +16,7 @@
     <button data-tool="pen" class="active">Pen</button>
     <button data-tool="rect">Rectangle</button>
     <button data-tool="select">Select / Move</button>
+    <button id="undoBtn">Undo (Ctrl+Z)</button>
     <span>(select a shape, then press Delete)</span>
   </div>
   <canvas id="c"></canvas>
@@ -37,6 +38,7 @@ const myColor = `hsl(${Math.floor(Math.random() * 360)}, 70%, 45%)`;
 const segs = [];           // freehand segments
 const shapes = new Map();  // id -> shape
 let tool = "pen";
+const history = [];        // inverse events for MY actions, newest last
 let lastSeq = 0;
 let selected = null;       // id of selected shape
 let preview = null;        // rectangle being dragged out
@@ -144,21 +146,23 @@ function connect() {
 connect();
 
 function emit(msg) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;   // offline: ignore input
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false;   // offline: ignore input
   if (msg.type === "seg") apply(msg);   // ephemeral: draw immediately
   ws.send(JSON.stringify(msg));
+  return true;
 }
 
 // ---------- toolbar ----------
-document.querySelectorAll("#bar button").forEach((b) => {
+document.querySelectorAll("#bar button[data-tool]").forEach((b) => {
   b.onclick = () => {
     tool = b.dataset.tool;
     selected = null;
-    document.querySelectorAll("#bar button")
+    document.querySelectorAll("#bar button[data-tool]")
       .forEach((x) => x.classList.toggle("active", x === b));
     render();
   };
 });
+document.getElementById("undoBtn").onclick = () => undo();
 
 // ---------- input ----------
 function hit(x, y) {
@@ -176,7 +180,8 @@ canvas.addEventListener("pointerdown", (e) => {
   } else if (tool === "select") {
     const s = hit(x, y);
     selected = s ? s.id : null;
-    if (s) drag = { kind: "move", id: s.id, dx: x - s.x, dy: y - s.y };
+    if (s) drag = { kind: "move", id: s.id, dx: x - s.x, dy: y - s.y,
+                    ox: s.x, oy: s.y, moved: false };
     render();
   }
 });
@@ -195,13 +200,19 @@ canvas.addEventListener("pointermove", (e) => {
     };
     render();
   } else if (drag.kind === "move") {
-    emit({ type: "move", id: drag.id, x: x - drag.dx, y: y - drag.dy });
+    if (emit({ type: "move", id: drag.id, x: x - drag.dx, y: y - drag.dy })) drag.moved = true;
   }
 });
 
 function endDrag() {
   if (drag && drag.kind === "rect" && preview && preview.w > 5 && preview.h > 5) {
-    emit({ type: "add", shape: { id: crypto.randomUUID(), kind: "rect", color: myColor, ...preview } });
+    const id = crypto.randomUUID();
+    if (emit({ type: "add", shape: { id, kind: "rect", color: myColor, ...preview } })) {
+      history.push({ type: "delete", id });
+    }
+  }
+  if (drag && drag.kind === "move" && drag.moved) {
+    history.push({ type: "move", id: drag.id, x: drag.ox, y: drag.oy });
   }
   preview = null;
   drag = null;
@@ -210,9 +221,31 @@ function endDrag() {
 canvas.addEventListener("pointerup", endDrag);
 canvas.addEventListener("pointerleave", endDrag);
 
+function undo() {
+  while (history.length) {
+    const inv = history[history.length - 1];
+    // Skip entries someone else has already made pointless (the shape is gone).
+    const relevant = inv.type === "add" || shapes.has(inv.id);
+    if (!relevant) {
+      history.pop();
+      continue;
+    }
+    if (emit(inv)) history.pop();   // if offline, keep it for later
+    return;
+  }
+}
+
 window.addEventListener("keydown", (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z") {
+    e.preventDefault();
+    undo();
+    return;
+  }
   if ((e.key === "Delete" || e.key === "Backspace") && selected) {
-    emit({ type: "delete", id: selected });
+    const s = shapes.get(selected);
+    if (s && emit({ type: "delete", id: selected })) {
+      history.push({ type: "add", shape: { ...s } });   // undo = put it back
+    }
   }
 });
 </script>
