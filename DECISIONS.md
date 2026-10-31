@@ -564,3 +564,5 @@ all of which a real deployment needs. NGINX is not instrumented.
   batching, and `requestAnimationFrame` rendering.
 - Boards stay in the hub's memory after their room empties, so memory grows.
   Fix: evict after a final save.
+- NGINX itself is not instrumented; add an exporter if proxy-level metrics are
+  needed.
