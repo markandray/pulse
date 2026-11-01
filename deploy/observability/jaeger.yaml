@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jaeger
+  namespace: pulse
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jaeger
+  template:
+    metadata:
+      labels:
+        app: jaeger
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: jaeger
+          image: cr.jaegertracing.io/jaegertracing/jaeger:2.11.0
+          ports:
+            - { name: ui, containerPort: 16686 }
+            - { name: otlp-http, containerPort: 4318 }
+            - { name: otlp-grpc, containerPort: 4317 }
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 16686
+          resources:
+            requests:
+              memory: 128Mi
+            limits:
+              memory: 768Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger
+  namespace: pulse
+spec:
+  selector:
+    app: jaeger
+  ports:
+    - { name: ui, port: 16686 }
+    - { name: otlp-http, port: 4318 }
+    - { name: otlp-grpc, port: 4317 }

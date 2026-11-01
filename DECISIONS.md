@@ -554,6 +554,30 @@ from ConfigMaps with anonymous access, for local use only.
 no persistence (metrics vanish when Prometheus restarts), and no authentication,
 all of which a real deployment needs. NGINX is not instrumented.
 
+## 30. Traces follow an event through the log via Kafka headers
+
+**Context:** An event's latency is spread over a WebSocket read, a Kafka
+produce, the broker, and consumption on every pod. Metrics show the total, not
+where the time went.
+
+**Decision:** The root span starts when a valid shape event is received and the
+sampling decision is made there; everything downstream follows the parent. The
+publisher injects the W3C trace context into the Kafka record headers, and each
+consuming pod extracts it and starts `hub.apply` and `hub.broadcast` spans as
+children, so one trace shows the same event being applied on every pod. Records
+read during replay are never given a trace context, because stored headers can
+refer to traces from long ago and would flood the backend on every restart.
+Freehand strokes are not traced. Tracing is off unless
+`OTEL_EXPORTER_OTLP_ENDPOINT` is set, and the sample ratio is configurable.
+
+**Alternatives:** Putting a trace id in the event body; tracing every event; a
+link between spans instead of parent-child.
+
+**Trade-off:** Consume-side spans exist on every pod, so trace volume scales
+with the number of replicas. Span timestamps come from each pod's own clock, so
+cross-pod durations are only trustworthy where clocks agree, as on a single
+host. Jaeger runs with in-memory storage, so traces disappear when it restarts.
+
 ---
 
 ## Known gaps and future work

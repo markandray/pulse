@@ -12,6 +12,8 @@ env:
   KAFKA_BROKERS: kafka:9092
   PERSIST_INTERVAL: 1s
   SHUTDOWN_DELAY: 5s
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+  TRACE_SAMPLE_RATIO: "1.0"   # lower this (0.01) before the load test
 
 resources:
   requests:
