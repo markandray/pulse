@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -30,6 +32,34 @@ var mPublishAck = promauto.NewHistogram(prometheus.HistogramOpts{
 	Help:    "Time from handing an event to the Kafka client until the broker acknowledged it.",
 	Buckets: []float64{.001, .002, .005, .01, .015, .02, .03, .05, .1, .25, .5, 1},
 })
+
+var mLag = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "pulse_log_lag_records",
+	Help: "Records in the log that this instance has not yet delivered to its hub, by partition.",
+}, []string{"partition"})
+
+func (l *Log) sampleLag(ctx context.Context, last map[int32]*atomic.Int64) {
+	adm := kadm.NewClient(l.cl)
+	t := time.NewTicker(5 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		ends, err := adm.ListEndOffsets(ctx, l.topic)
+		if err != nil {
+			log.Printf("eventlog: sample log lag: %v", err)
+			continue
+		}
+		ends.Each(func(o kadm.ListedOffset) {
+			if p, ok := last[o.Partition]; ok && o.Err == nil {
+				mLag.WithLabelValues(strconv.Itoa(int(o.Partition))).Set(float64(o.Offset - (p.Load() + 1)))
+			}
+		})
+	}
+}
 
 // headerCarrier lets the OpenTelemetry propagator read and write a Kafka
 // record's headers, which is how a trace crosses the log.
@@ -178,6 +208,7 @@ func (l *Log) Consume(ctx context.Context, start map[int32]int64,
 
 	parts := map[int32]kgo.Offset{}
 	pending := map[int32]int64{} // partition -> last offset we must deliver before we are "ready"
+	last := map[int32]*atomic.Int64{}
 	var bad error
 	ends.Each(func(o kadm.ListedOffset) {
 		if bad != nil {
@@ -197,6 +228,9 @@ func (l *Log) Consume(ctx context.Context, start map[int32]int64,
 				o.Partition, from-1, o.Offset)
 			return
 		}
+		p := &atomic.Int64{}
+		p.Store(from - 1)
+		last[o.Partition] = p
 		parts[o.Partition] = kgo.NewOffset().At(from)
 		if o.Offset > from {
 			pending[o.Partition] = o.Offset - 1
@@ -214,6 +248,7 @@ func (l *Log) Consume(ctx context.Context, start map[int32]int64,
 		return err
 	}
 	defer cons.Close()
+	go l.sampleLag(ctx, last)
 
 	replayed := 0
 	replaying := len(pending) > 0
@@ -238,6 +273,9 @@ func (l *Log) Consume(ctx context.Context, start map[int32]int64,
 				rctx = otel.GetTextMapPropagator().Extract(context.Background(), headerCarrier{r})
 			}
 			deliver(rctx, string(r.Key), r.Value, r.Partition, r.Offset)
+			if p, ok := last[r.Partition]; ok {
+				p.Store(r.Offset)
+			}
 			replayed++
 			if last, ok := pending[r.Partition]; ok && r.Offset >= last {
 				delete(pending, r.Partition)

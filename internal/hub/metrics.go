@@ -39,7 +39,15 @@ var (
 	mPublishToApply = promauto.NewHistogram(prometheus.HistogramOpts{
 		Name:    "pulse_publish_to_apply_seconds",
 		Help:    "Time from publishing a shape event to applying it on this instance (live events only).",
-		Buckets: []float64{.001, .002, .005, .01, .015, .02, .03, .05, .1, .25, .5, 1, 2.5},
+		Buckets: []float64{.001, .002, .005, .01, .015, .02, .03, .05, .1, .25, .5, 1, 2.5, 5, 10, 30, 60},
+	})
+	mSendQueueMax = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "pulse_send_queue_max",
+		Help: "Length of the fullest per-client send queue on this instance (capacity 64).",
+	})
+	mSendQueueTotal = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "pulse_send_queue_total",
+		Help: "Messages waiting in all per-client send queues on this instance.",
 	})
 	mBroadcastSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
 		Name:    "pulse_broadcast_seconds",

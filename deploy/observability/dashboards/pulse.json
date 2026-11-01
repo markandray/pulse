@@ -101,6 +101,27 @@
       "targets": [
         { "refId": "A", "expr": "max(pulse_replay_duration_seconds)" }
       ]
+    },
+    {
+      "id": 11, "type": "timeseries", "title": "Log lag (records not yet delivered to the hub, per pod)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 40, "w": 8, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [ { "refId": "A", "expr": "sum by (pod) (pulse_log_lag_records)", "legendFormat": "{{pod}}" } ]
+    },
+    {
+      "id": 12, "type": "timeseries", "title": "Fullest client send queue (capacity 64, per pod)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 8, "y": 40, "w": 8, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "short", "max": 64 }, "overrides": [] },
+      "targets": [ { "refId": "A", "expr": "max by (pod) (pulse_send_queue_max)", "legendFormat": "{{pod}}" } ]
+    },
+    {
+      "id": 13, "type": "timeseries", "title": "Pulse CPU (cores, per pod)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 16, "y": 40, "w": 8, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [ { "refId": "A", "expr": "sum by (pod) (rate(process_cpu_seconds_total[30s]))", "legendFormat": "{{pod}}" } ]
     }
   ]
 }

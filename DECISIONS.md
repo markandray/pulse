@@ -595,6 +595,20 @@ to its CPU and memory figures. Server-side metrics are compared with the
 generator's latency to tell whether a slowdown is inside the app. A run adds
 its events to the permanent log, which is itself a measure of replay cost.
 
+## 32. Overload behaviour: ingress is unbounded (known gap)
+
+**Observation:** In the load test, offered load above what this setup can serve
+did not produce errors or disconnects. Latency grew to tens of seconds while
+nearly all clients stayed connected, because the only protective rule (dropping
+a client whose send queue is full) concerns slow receivers, not incoming load.
+
+**Consequence:** An overloaded instance accepts everything and queues it, so
+users see long stalls instead of a fast, explicit failure.
+
+**Not done, and why:** Per-connection rate limits, a bounded publish queue that
+sheds events with a "busy" response, and room-aware routing were left out of
+scope. They are the first changes to make before real use.
+
 ---
 
 ## Known gaps and future work

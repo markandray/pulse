@@ -408,6 +408,8 @@ func (h *Hub) Run() {
 		defer t.Stop()
 		tick = t.C
 	}
+	sample := time.NewTicker(time.Second)
+	defer sample.Stop()
 
 	for {
 		select {
@@ -436,6 +438,20 @@ func (h *Hub) Run() {
 
 		case rec := <-h.records:
 			h.handleRecord(rec)
+
+		case <-sample.C:
+			maxQ, total := 0, 0
+			for _, clients := range h.rooms {
+				for c := range clients {
+					n := len(c.send)
+					total += n
+					if n > maxQ {
+						maxQ = n
+					}
+				}
+			}
+			mSendQueueMax.Set(float64(maxQ))
+			mSendQueueTotal.Set(float64(total))
 
 		case <-tick:
 			if !h.flushing {
