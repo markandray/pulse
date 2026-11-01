@@ -35,6 +35,8 @@ type stats struct {
     dropped   atomic.Int64 // connections that died during the run
     sent      atomic.Int64
     received  atomic.Int64
+    addsSent  atomic.Int64
+    echoed    atomic.Int64
 
     mu     sync.Mutex
     window []time.Duration // echo latencies since the last report
@@ -42,6 +44,7 @@ type stats struct {
 }
 
 func (s *stats) observe(d time.Duration) {
+    s.echoed.Add(1)
     s.mu.Lock()
     s.window = append(s.window, d)
     s.all = append(s.all, d)
@@ -79,7 +82,6 @@ func runClient(id int, room string, cfg config, st *stats, stop <-chan struct{},
     }
     st.connected.Add(1)
     defer st.connected.Add(-1)
-    defer conn.Close()
 
     prefix := fmt.Sprintf("c%d-", id)
     closing := make(chan struct{}) // closed by the reader when the connection ends
@@ -110,6 +112,10 @@ func runClient(id int, room string, cfg config, st *stats, stop <-chan struct{},
                 }
             }
         }
+    }()
+    defer func() {
+        conn.Close()
+        <-closing
     }()
 
     rng := rand.New(rand.NewSource(int64(id) + time.Now().UnixNano()))
@@ -152,9 +158,11 @@ func runClient(id int, room string, cfg config, st *stats, stop <-chan struct{},
         case <-tick.C:
         }
 
+        isAdd := false
         var msg map[string]any
         switch {
         case len(mine) < 3: // add a shape; its id carries the send time
+            isAdd = true
             n++
             sid := fmt.Sprintf("c%d-%d-%d", id, n, time.Now().UnixNano())
             mine = append(mine, sid)
@@ -170,7 +178,13 @@ func runClient(id int, room string, cfg config, st *stats, stop <-chan struct{},
                 "x": float64(rng.Intn(800)), "y": float64(rng.Intn(600))}
         }
         data, _ := json.Marshal(msg)
+        if isAdd {
+            st.addsSent.Add(1)
+        }
         if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+            if isAdd {
+                st.addsSent.Add(-1)
+            }
             st.dropped.Add(1)
             return
         }
@@ -229,9 +243,10 @@ loop:
         case now := <-report.C:
             sent, recv := st.sent.Load(), st.received.Load()
             dt := now.Sub(lastT).Seconds()
-            fmt.Printf("t=%3.0fs conns=%d failed=%d dropped=%d sent=%.0f/s recv=%.0f/s echo: %s\n",
+            fmt.Printf("t=%3.0fs conns=%d failed=%d dropped=%d sent=%.0f/s recv=%.0f/s behind=%d echo: %s\n",
                 now.Sub(start).Seconds(), st.connected.Load(), st.failed.Load(), st.dropped.Load(),
-                float64(sent-lastSent)/dt, float64(recv-lastRecv)/dt, summarize(st.takeWindow()))
+                float64(sent-lastSent)/dt, float64(recv-lastRecv)/dt,
+                st.addsSent.Load()-st.echoed.Load(), summarize(st.takeWindow()))
             lastSent, lastRecv, lastT = sent, recv, now
         case <-deadline:
             break loop
@@ -247,6 +262,10 @@ loop:
     fmt.Println("---- summary ----")
     fmt.Printf("sent=%d received=%d fan-out=%.1fx failed=%d dropped=%d\n",
         sent, recv, float64(recv)/float64(max(sent, 1)), st.failed.Load(), st.dropped.Load())
+    sentAdds := st.addsSent.Load()
+    fmt.Printf("adds sent=%d echoed=%d (%.1f%% never came back during the run, so latencies are lower bounds)\n",
+        sentAdds, st.echoed.Load(),
+        100*float64(sentAdds-st.echoed.Load())/float64(max(sentAdds, 1)))
     fmt.Println("echo latency over the whole run:", summarize(st.all))
     if st.failed.Load() > 0 {
         fmt.Println("hint: failed connections usually mean the file-descriptor limit; run `ulimit -n 10240` first")

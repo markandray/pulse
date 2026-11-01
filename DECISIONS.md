@@ -597,17 +597,44 @@ its events to the permanent log, which is itself a measure of replay cost.
 
 ## 32. Overload behaviour: ingress is unbounded (known gap)
 
-**Observation:** In the load test, offered load above what this setup can serve
-did not produce errors or disconnects. Latency grew to tens of seconds while
-nearly all clients stayed connected, because the only protective rule (dropping
-a client whose send queue is full) concerns slow receivers, not incoming load.
+**Observation:** Three 60-second runs at 200 clients had p95 echo latency of
+35-36 ms; two runs at 300 clients had p95 around 135 ms. At 400 clients, six
+runs ranged from 149 ms to 16.1 s p95: two coped (0.15 s and 0.31 s) and four
+fell behind (3.5-16.1 s). Four runs were confirmed to start with measured lag
+below 10 records; they produced p95 values of 0.15 s, 3.54 s, 9.52 s, and
+16.10 s. The backlog state at the start of the other two runs was not recorded.
+This is consistent with the system sitting at its capacity, where small
+differences in available CPU can determine whether backlog grows, but the cause
+of the spread has not been established. The edge for this setup is roughly
+600-800 events/s.
 
-**Consequence:** An overloaded instance accepts everything and queues it, so
-users see long stalls instead of a fast, explicit failure.
+Across three 800-client runs, p50 echo latency ranged from 6.2 to 11.6 s and
+p95 from 17.6 to 31.1 s; generator-reported drops ranged from 6 to 71. In an
+instrumented 800-client run, 28.2% of adds had not echoed at run end. Echo
+percentiles include only adds echoed before the loadgen stops; queued events
+are censored, making overload latency a lower bound. A prior 800-client run
+showed every pod's consumer lag at about 56-61k records, while the fullest
+per-client send queue stayed below 29 of 64 slots (sampled once per second) and
+each pod used about 2 CPU cores. One 800-client run dropped 71 clients, so slow
+receivers are a secondary effect.
 
-**Not done, and why:** Per-connection rate limits, a bounded publish queue that
-sheds events with a "busy" response, and room-aware routing were left out of
-scope. They are the first changes to make before real use.
+A separate single-room verification run had 61 generator-reported drops while
+the server slow-client counter increased by 69; the counts did not match
+exactly. Over the six-hour Prometheus window, resident memory peaked at about
+104 MiB per pod.
+
+**Consequence:** The lag, queue, and CPU measurements point to the per-pod
+consume/apply path as the primary overload limit, with slow receivers a
+secondary effect. Each pod applies every event, so adding replicas is expected
+to increase connection and fan-out capacity but not apply capacity; this scaling
+effect was not tested. No single result establishes an exact stable capacity:
+the measured edge is roughly 600-800 events/s on this setup.
+
+**Not done, and why:** Per-connection rate limits and a bounded publish queue
+that sheds events with a "busy" response remain the first changes to make
+before real use. Room-aware routing could scale the apply rate, but would add
+complexity. No CPU profile was captured, so the evidence identifies the
+consume/apply path but not its function-level hotspot.
 
 ---
 
