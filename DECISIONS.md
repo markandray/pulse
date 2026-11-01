@@ -578,6 +578,23 @@ with the number of replicas. Span timestamps come from each pod's own clock, so
 cross-pod durations are only trustworthy where clocks agree, as on a single
 host. Jaeger runs with in-memory storage, so traces disappear when it restarts.
 
+## 31. How the load test measures, and what it can and cannot say
+
+**Decision:** A Go client swarm opens real WebSocket connections through NGINX
+and sends a mix of adds, moves and deletes (plus optional strokes) at a fixed
+per-client rate, spread over a configurable number of rooms. Latency is
+measured end to end by embedding the send time in the id of each added shape and
+subtracting it when the shape is echoed back from the log. Room size is varied
+on purpose, because outbound traffic is events per second multiplied by clients
+per room. Clients delete their shapes on exit, since the log is permanent.
+Tracing is sampled at 1% during the test.
+
+**Trade-off:** The generator, the cluster, Docker's VM and the browser share one
+laptop, so absolute numbers describe this machine and are only meaningful next
+to its CPU and memory figures. Server-side metrics are compared with the
+generator's latency to tell whether a slowdown is inside the app. A run adds
+its events to the permanent log, which is itself a measure of replay cost.
+
 ---
 
 ## Known gaps and future work
