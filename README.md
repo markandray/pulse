@@ -8,7 +8,7 @@ replayable event log), MongoDB holds snapshots that keep restarts fast, and
 Kubernetes runs three interchangeable Go pods behind NGINX. Prometheus, Grafana and
 Jaeger show what it is doing.
 
-![Pulse demo](docs/demo.gif)
+![Pulse demo](docs/demo.gif)...
 
 ## Architecture
 
