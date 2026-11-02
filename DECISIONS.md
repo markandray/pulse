@@ -638,13 +638,3 @@ consume/apply path but not its function-level hotspot.
 
 ---
 
-## Known gaps and future work
-
-- Z-order is unstable after reload because snapshots come from map iteration.
-  Fix: store a creation `seq` on each shape and sort by it.
-- One message per mouse move, and a full redraw on every event. Candidates:
-  batching, and `requestAnimationFrame` rendering.
-- Boards stay in the hub's memory after their room empties, so memory grows.
-  Fix: evict after a final save.
-- NGINX itself is not instrumented; add an exporter if proxy-level metrics are
-  needed.
